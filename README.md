@@ -313,9 +313,6 @@ This reflects how RAG systems are actually built and deployed in production.
 ## 👨‍💻 Author
 
 **Chinmay**
-- IABAC Certified AI Engineer
-- NASSCOM Certified
-- Background in Finance + AI/ML Engineering
 - 📍 Bengaluru, India
 
 ---
