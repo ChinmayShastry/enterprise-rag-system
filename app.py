@@ -1,334 +1,345 @@
+"""
+app.py — Enterprise RAG Assistant
+Streamlit frontend for the RAG system.
+
+Changes from original:
+  - Config and users loaded from YAML files, not hardcoded
+  - API key loaded from .env if present — users don't re-type it every session
+  - CrossEncoder reranker is now actually wired into the pipeline
+  - max_results and top_n_rerank respected end-to-end per role
+  - Streaming responses (token by token, no blank wait screen)
+  - Feedback buttons use unique IDs — no key collisions, no double-voting
+  - Dashboard is hard-gated (st.stop) not just a warning
+  - Source list reflects only the chunks passed to the LLM
+"""
+
 import os
-import json
-import datetime
+import uuid
+import yaml
 import streamlit as st
-from openai import OpenAI
-from langchain_community.vectorstores import Chroma
-from langchain_openai import OpenAIEmbeddings
-from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
-from langchain_core.documents import Document
+from dotenv import load_dotenv
 
-# ─────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────
-LOG_FILE       = "logs/query_log.jsonl"
-FEEDBACK_FILE  = "logs/feedback_log.jsonl"
-os.makedirs("logs", exist_ok=True)
+from rag.auth import authenticate, get_permissions
+from rag.retrieval import load_resources, hybrid_search, rerank
+from rag.generation import stream_answer, get_sources
+from rag.logger import log_query, save_feedback, load_logs, load_feedback
 
-# ─────────────────────────────────────────
-# USERS & ROLES
-# ─────────────────────────────────────────
-USERS = {
-    "alice": {"password": "alice123", "role": "admin"},
-    "bob":   {"password": "bob123",   "role": "support"},
-    "guest": {"password": "guest123", "role": "viewer"},
+load_dotenv()
+
+# ─────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────
+
+@st.cache_data
+def load_config() -> dict:
+    with open("config/config.yaml", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+config = load_config()
+app_cfg = config["app"]
+rag_cfg = config["rag"]
+
+st.set_page_config(
+    page_title=app_cfg["title"],
+    page_icon=app_cfg["icon"],
+    layout="wide",
+)
+
+# ─────────────────────────────────────────────────────────────────
+# Session state defaults
+# ─────────────────────────────────────────────────────────────────
+
+_DEFAULTS = {
+    "logged_in": False,
+    "user": None,
+    "api_key": None,
+    "chat_history": [],  # list of {id, question, answer, sources}
+    "voted": set(),      # set of chat entry IDs that have received feedback
 }
-ROLE_PERMISSIONS = {
-    "admin":   {"can_query": True, "can_see_sources": True,  "max_results": 8},
-    "support": {"can_query": True, "can_see_sources": True,  "max_results": 5},
-    "viewer":  {"can_query": True, "can_see_sources": False, "max_results": 3},
-}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-# ─────────────────────────────────────────
-# LOAD MODELS (cached so they load once)
-# ─────────────────────────────────────────
-@st.cache_resource
-def load_resources(api_key):
-    client = OpenAI(api_key=api_key)
-
-    embedding_model = OpenAIEmbeddings(
-        model="text-embedding-3-small",
-        openai_api_key=api_key
-    )
-    vectorstore = Chroma(
-        collection_name="lloyd_manual",
-        embedding_function=embedding_model,
-        persist_directory="./chroma_db"
-    )
-
-    # Rebuild BM25 from vectorstore chunks
-    all_docs = vectorstore.get()
-    chunks = [
-        Document(page_content=text, metadata=meta)
-        for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
-    ]
-    tokenized = [doc.page_content.lower().split() for doc in chunks]
-    bm25 = BM25Okapi(tokenized)
+# Pre-fill API key from environment if available
+_env_key = os.getenv("OPENAI_API_KEY")
+if _env_key and not st.session_state.api_key:
+    st.session_state.api_key = _env_key
 
 
-    return client, vectorstore, chunks, bm25
+# ─────────────────────────────────────────────────────────────────
+# LOGIN SCREEN
+# ─────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────
-# CORE FUNCTIONS
-# ─────────────────────────────────────────
-def rewrite_query(client, question):
-    prompt = f"""Rewrite the question below into 3 different search queries using alternative words.
-Return ONLY a numbered list. Nothing else.
-
-Question: {question}
-Rewritten queries:"""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3
-    )
-    raw = response.choices[0].message.content.strip()
-    queries = [
-        line.split(". ", 1)[1].strip()
-        for line in raw.split("\n")
-        if line.strip() and line[0].isdigit()
-    ]
-    return queries
-
-def hybrid_search(client, vectorstore, chunks, bm25, question, k=3):
-    queries = rewrite_query(client, question)
-    queries.append(question)
-    seen = {}
-    for query in queries:
-        for doc in vectorstore.similarity_search(query, k=k):
-            key = doc.page_content[:100]
-            if key not in seen:
-                seen[key] = doc
-        scores = bm25.get_scores(query.lower().split())
-        for idx in scores.argsort()[::-1][:k]:
-            if scores[idx] > 0:
-                key = chunks[idx].page_content[:100]
-                if key not in seen:
-                    seen[key] = chunks[idx]
-    return list(seen.values())
-
-def rerank(reranker, question, docs, top_n=3):
-    pairs  = [[question, doc.page_content] for doc in docs]
-    scores = reranker.predict(pairs)
-    sorted_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in sorted_docs[:top_n]]
-
-def generate_answer(client, question, docs):
-    context = ""
-    sources = []
-    for i, doc in enumerate(docs):
-        context += f"[Chunk {i+1} - Page {doc.metadata['page']}]\n{doc.page_content}\n\n"
-        sources.append(f"Page {doc.metadata['page']}")
-    prompt = f"""You are a helpful assistant for Lloyd washing machine users.
-Answer using ONLY the context below. If the answer is not there, say so.
-Always mention which page your answer comes from.
-
-Context:
-{context}
-
-Question: {question}
-Answer:"""
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-    return response.choices[0].message.content, list(set(sources))
-
-def log_query(user, question, answer, sources):
-    entry = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "username": user["username"],
-        "role": user["role"],
-        "question": question,
-        "answer": answer,
-        "sources": sources
-    }
-    with open(LOG_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-def save_feedback(user, question, answer, feedback):
-    entry = {
-        "timestamp": datetime.datetime.now().isoformat(),
-        "username": user["username"],
-        "role": user["role"],
-        "question": question,
-        "answer": answer[:200],
-        "feedback": feedback
-    }
-    with open(FEEDBACK_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
-
-# ─────────────────────────────────────────
-# STREAMLIT UI
-# ─────────────────────────────────────────
-st.set_page_config(page_title="Lloyd Knowledge AI", page_icon="🤖", layout="wide")
-
-# Session state
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "user" not in st.session_state:
-    st.session_state.user = None
-if "api_key" not in st.session_state:
-    st.session_state.api_key = None
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "last_answer" not in st.session_state:
-    st.session_state.last_answer = None
-if "last_question" not in st.session_state:
-    st.session_state.last_question = None
-
-# ── LOGIN SCREEN ──
 if not st.session_state.logged_in:
-    st.title("🤖 Lloyd Knowledge AI Assistant")
-    st.subheader("Please log in to continue")
+    st.title(f"{app_cfg['icon']} {app_cfg['title']}")
+    st.markdown(f"*{app_cfg['description']}*")
+    st.divider()
 
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        api_key  = st.text_input("🔑 OpenAI API Key", type="password",
-                                  placeholder="sk-...")
+    col_form, col_info = st.columns([1, 1], gap="large")
+
+    with col_form:
+        st.subheader("Sign In")
+
+        # Only ask for API key if not in environment
+        if not _env_key:
+            api_key_input = st.text_input(
+                "🔑 OpenAI API Key",
+                type="password",
+                placeholder="sk-…",
+                help="Your key is used only for this session and never stored.",
+            )
+        else:
+            api_key_input = _env_key
+            st.info("🔑 API key loaded from environment.", icon="✅")
+
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
 
-        if st.button("Login", use_container_width=True):
-            if not api_key or not api_key.startswith("sk-"):
-                st.error("❌ Please enter a valid OpenAI API key (starts with sk-)")
+        if st.button("Sign In", use_container_width=True, type="primary"):
+            if not api_key_input or not api_key_input.startswith("sk-"):
+                st.error("Please enter a valid OpenAI API key (starts with sk-).")
             else:
-                user_data = USERS.get(username)
-                if user_data and user_data["password"] == password:
-                    st.session_state.logged_in  = True
-                    st.session_state.api_key    = api_key
-                    st.session_state.user       = {
-                        "username": username,
-                        "role": user_data["role"],
-                        "permissions": ROLE_PERMISSIONS[user_data["role"]]
-                    }
+                user = authenticate(username, password)
+                if user:
+                    st.session_state.logged_in = True
+                    st.session_state.api_key = api_key_input
+                    st.session_state.user = user
                     st.rerun()
                 else:
-                    st.error("❌ Invalid username or password")
+                    st.error("Invalid username or password.")
 
-    with col2:
-        st.info("**Demo accounts:**\n\n👤 alice / alice123 (admin)\n\n👤 bob / bob123 (support)\n\n👤 guest / guest123 (viewer)")
-        st.warning("⚠️ Your OpenAI API key is used only for your session and is never stored.")
+    with col_info:
+        st.subheader("Demo Accounts")
+        st.markdown("""
+| Username | Password | Role    | Sources | Depth |
+|----------|----------|---------|---------|-------|
+| alice    | alice123 | Admin   | ✅ Visible | 5 chunks |
+| bob      | bob123   | Support | ✅ Visible | 3 chunks |
+| guest    | guest123 | Viewer  | ❌ Hidden  | 2 chunks |
+        """)
+        st.caption(
+            "Different roles retrieve different amounts of context and control "
+            "what metadata is exposed in the UI."
+        )
 
-# ── MAIN APP ──
-else:
-    user        = st.session_state.user
-    permissions = user["permissions"]
+    st.stop()
 
-    # Load resources
-    client, vectorstore, chunks, bm25 = load_resources(st.session_state.api_key)
 
-    # Sidebar
-    with st.sidebar:
-        st.title("🤖 Lloyd AI")
-        st.markdown(f"**User:** {user['username']}")
-        st.markdown(f"**Role:** `{user['role']}`")
-        st.divider()
-        page = st.radio("Navigate", ["💬 Chat", "📊 Dashboard"])
-        st.divider()
-        if st.button("Logout"):
-            st.session_state.logged_in  = False
-            st.session_state.user       = None
-            st.session_state.chat_history = []
-            st.rerun()
+# ─────────────────────────────────────────────────────────────────
+# MAIN APP — user is logged in
+# ─────────────────────────────────────────────────────────────────
 
-    # ── CHAT PAGE ──
-    if page == "💬 Chat":
-        st.title("💬 Lloyd Washing Machine Assistant")
+user = st.session_state.get("user")
+if not user:
+    st.rerun()
 
-        # Show chat history
-        for chat in st.session_state.chat_history:
-            with st.chat_message("user"):
-                st.write(chat["question"])
-            with st.chat_message("assistant"):
-                st.write(chat["answer"])
-                if permissions["can_see_sources"] and chat["sources"]:
-                    st.caption(f"📄 Sources: {', '.join(chat['sources'])}")
+permissions = get_permissions(user["role"], config)
 
-        # Chat input
-        question = st.chat_input("Ask anything about your Lloyd washing machine...")
+# Load all ML resources (cached after first load)
+try:
+    client, vectorstore, chunks, bm25, reranker = load_resources(st.session_state.api_key)
+except Exception as e:
+    st.error(
+        f"⚠️ Failed to load resources: {e}\n\n"
+        "Make sure you have ingested a document first:\n"
+        "```\npython scripts/ingest.py --pdf data/your_document.pdf\n```"
+    )
+    st.stop()
 
-        if question:
-            with st.chat_message("user"):
-                st.write(question)
+if len(chunks) == 0:
+    st.warning(
+        "No documents are indexed yet. Run the ingestion script first:\n"
+        "```\npython scripts/ingest.py --pdf data/your_document.pdf\n```"
+    )
+    st.stop()
 
-            with st.chat_message("assistant"):
-                with st.spinner("🔍 Searching manual..."):
-                    # Full pipeline
-                    # raw_docs   = hybrid_search(client, vectorstore, chunks, bm25, question, k=8)
-                    # top_docs   = rerank(reranker, question, raw_docs, top_n=5)
-                    # raw_docs   = hybrid_search(client, vectorstore, chunks, bm25, question, k=8)
-                    # top_docs   = raw_docs[:5]  # Skip re-ranker temporarily
-                    top_docs   = hybrid_search(client, vectorstore, chunks, bm25, question, k=5)
-                    answer, sources = generate_answer(client, question, top_docs)
+# ── Sidebar ──────────────────────────────────────────────────────
+with st.sidebar:
+    st.title(f"{app_cfg['icon']} {app_cfg['title']}")
+    st.divider()
+    st.markdown(f"**{user['display_name']}**")
+    st.caption(f"Role: `{user['role']}`")
+    st.caption(f"Retrieval depth: {permissions['top_n_rerank']} chunks")
+    st.divider()
 
-                st.write(answer)
-                if permissions["can_see_sources"]:
-                    st.caption(f"📄 Sources: {', '.join(sources)}")
+    page = st.radio("Navigate", ["💬 Chat", "📊 Dashboard"], label_visibility="collapsed")
+    st.divider()
 
-                # Feedback buttons
-                st.markdown("**Was this helpful?**")
-                col1, col2 = st.columns([1, 8])
-                with col1:
-                    if st.button("👍", key=f"up_{len(st.session_state.chat_history)}"):
-                        save_feedback(user, question, answer, "useful")
-                        st.success("Thanks!")
-                with col2:
-                    if st.button("👎", key=f"down_{len(st.session_state.chat_history)}"):
-                        save_feedback(user, question, answer, "not_useful")
-                        st.success("Thanks for the feedback!")
+    if st.button("Sign Out", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
 
-            # Log and save to history
-            log_query(user, question, answer, sources)
-            st.session_state.chat_history.append({
-                "question": question,
-                "answer": answer,
-                "sources": sources
-            })
+    st.caption(
+        f"📦 {len(chunks)} chunks indexed · "
+        f"Model: `{rag_cfg['llm_model']}`"
+    )
 
-    # ── DASHBOARD PAGE ──
-    elif page == "📊 Dashboard":
-        st.title("📊 Evaluation Dashboard")
 
-        if user["role"] != "admin":
-            st.warning("⚠️ Dashboard is only available to admins.")
+# ─────────────────────────────────────────────────────────────────
+# CHAT PAGE
+# ─────────────────────────────────────────────────────────────────
+
+if page == "💬 Chat":
+    st.title("💬 Chat")
+
+    # Render conversation history
+    for entry in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.write(entry["question"])
+
+        with st.chat_message("assistant"):
+            st.write(entry["answer"])
+            if permissions["can_see_sources"] and entry["sources"]:
+                st.caption(f"📄 Sources: {', '.join(entry['sources'])}")
+
+            # Feedback — use stored ID to prevent key collisions and double-votes
+            _mid = entry["id"]
+            if _mid in st.session_state.voted:
+                st.caption("✅ Feedback recorded")
+            else:
+                cols = st.columns([1, 1, 10])
+                with cols[0]:
+                    if st.button("👍", key=f"up_{_mid}"):
+                        save_feedback(user, entry["question"], entry["answer"], "useful")
+                        st.session_state.voted.add(_mid)
+                        st.rerun()
+                with cols[1]:
+                    if st.button("👎", key=f"dn_{_mid}"):
+                        save_feedback(user, entry["question"], entry["answer"], "not_useful")
+                        st.session_state.voted.add(_mid)
+                        st.rerun()
+
+    # Chat input
+    question = st.chat_input(f"Ask anything about your documents…")
+
+    if question:
+        with st.chat_message("user"):
+            st.write(question)
+
+        with st.chat_message("assistant"):
+            # Retrieval phase — show spinner while searching
+            with st.spinner("🔍 Searching documents…"):
+                raw_docs = hybrid_search(
+                    client, vectorstore, chunks, bm25,
+                    question,
+                    llm_model=rag_cfg["llm_model"],
+                    k=permissions["max_results"],
+                )
+                top_docs = rerank(
+                    reranker, question, raw_docs,
+                    top_n=permissions["top_n_rerank"],
+                )
+
+            sources = get_sources(top_docs)
+
+            # Stream the answer token by token
+            answer = st.write_stream(
+                stream_answer(
+                    client, question, top_docs,
+                    llm_model=rag_cfg["llm_model"],
+                    persona=app_cfg["persona"],
+                )
+            )
+
+            if permissions["can_see_sources"] and sources:
+                st.caption(f"📄 Sources: {', '.join(sources)}")
+
+            # Feedback buttons for the new message
+            new_id = str(uuid.uuid4())[:8]
+            cols = st.columns([1, 1, 10])
+            with cols[0]:
+                if st.button("👍", key=f"up_{new_id}"):
+                    save_feedback(user, question, answer, "useful")
+                    st.session_state.voted.add(new_id)
+            with cols[1]:
+                if st.button("👎", key=f"dn_{new_id}"):
+                    save_feedback(user, question, answer, "not_useful")
+                    st.session_state.voted.add(new_id)
+
+        # Persist to history and log
+        log_query(user, question, answer, sources)
+        st.session_state.chat_history.append({
+            "id": new_id,
+            "question": question,
+            "answer": answer,
+            "sources": sources,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────
+# DASHBOARD PAGE (admin only — hard gate)
+# ─────────────────────────────────────────────────────────────────
+
+elif page == "📊 Dashboard":
+    if user["role"] != "admin":
+        st.error("⛔ Access denied. The dashboard is only available to admin users.")
+        st.stop()
+
+    st.title("📊 Evaluation Dashboard")
+
+    queries = load_logs()
+    feedbacks = load_feedback()
+
+    # ── Top metrics ──────────────────────────────────────────────
+    useful = sum(1 for f in feedbacks if f["feedback"] == "useful")
+    not_useful = sum(1 for f in feedbacks if f["feedback"] == "not_useful")
+    satisfaction = round(useful / len(feedbacks) * 100, 1) if feedbacks else 0.0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Queries", len(queries))
+    m2.metric("Feedback Received", len(feedbacks))
+    m3.metric("👍 Useful", useful)
+    m4.metric("🎯 Satisfaction", f"{satisfaction}%")
+
+    st.divider()
+
+    # ── Queries by role ───────────────────────────────────────────
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.subheader("Queries by Role")
+        if queries:
+            role_counts: dict[str, int] = {}
+            for q in queries:
+                role_counts[q["role"]] = role_counts.get(q["role"], 0) + 1
+            # st.bar_chart expects a dict or dataframe
+            st.bar_chart(role_counts)
         else:
-            # Query stats
-            queries = []
-            if os.path.exists(LOG_FILE):
-                with open(LOG_FILE, "r") as f:
-                    queries = [json.loads(l) for l in f.readlines()]
+            st.caption("No queries logged yet.")
 
-            feedbacks = []
-            if os.path.exists(FEEDBACK_FILE):
-                with open(FEEDBACK_FILE, "r") as f:
-                    feedbacks = [json.loads(l) for l in f.readlines()]
+    with col_right:
+        st.subheader("Feedback Breakdown")
+        if feedbacks:
+            st.bar_chart({"👍 Useful": useful, "👎 Not Useful": not_useful})
+        else:
+            st.caption("No feedback logged yet.")
 
-            # Metrics row
-            col1, col2, col3, col4 = st.columns(4)
-            useful     = sum(1 for fb in feedbacks if fb["feedback"] == "useful")
-            not_useful = sum(1 for fb in feedbacks if fb["feedback"] == "not_useful")
-            score      = (useful / len(feedbacks) * 100) if feedbacks else 0
+    st.divider()
 
-            col1.metric("Total Queries",    len(queries))
-            col2.metric("Total Feedback",   len(feedbacks))
-            col3.metric("👍 Useful",        useful)
-            col4.metric("🎯 Satisfaction",  f"{score:.1f}%")
+    # ── Recent queries ────────────────────────────────────────────
+    st.subheader("Recent Queries")
+    if queries:
+        for entry in reversed(queries[-15:]):
+            label = f"[{entry['username']} · {entry['role']}]  {entry['question'][:70]}"
+            with st.expander(label):
+                st.caption(f"🕐 {entry['timestamp']}")
+                st.markdown(f"**Answer:** {entry['answer'][:400]}…")
+                if entry.get("sources"):
+                    st.caption(f"📄 Sources: {', '.join(entry['sources'])}")
+    else:
+        st.caption("No queries logged yet.")
 
-            st.divider()
+    st.divider()
 
-            # Recent queries table
-            st.subheader("📋 Recent Queries")
-            if queries:
-                for q in reversed(queries[-10:]):
-                    with st.expander(f"[{q['username']}] {q['question'][:60]}..."):
-                        st.markdown(f"**Time:** {q['timestamp']}")
-                        st.markdown(f"**Role:** {q['role']}")
-                        st.markdown(f"**Answer:** {q['answer'][:300]}...")
-                        st.markdown(f"**Sources:** {', '.join(q['sources'])}")
-
-            st.divider()
-
-            # System health
-            st.subheader("⚙️ System Health")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown(f"- **Vector DB chunks:** {vectorstore._collection.count()}")
-                st.markdown(f"- **BM25 index size:** {len(chunks)} chunks")
-                st.markdown(f"- **LLM:** gpt-4o-mini")
-            with col2:
-                st.markdown(f"- **Embeddings:** text-embedding-3-small")
-                st.markdown(f"- **Re-ranker:** ms-marco-MiniLM-L-6-v2")
-                st.markdown(f"- **Log file:** {LOG_FILE}")
+    # ── System health ─────────────────────────────────────────────
+    st.subheader("System Health")
+    h1, h2 = st.columns(2)
+    with h1:
+        st.markdown(f"- **Indexed chunks:** {len(chunks)}")
+        st.markdown(f"- **Vector DB:** ChromaDB · `{rag_cfg['collection_name']}`")
+        st.markdown(f"- **LLM:** `{rag_cfg['llm_model']}`")
+    with h2:
+        st.markdown(f"- **Embeddings:** `{rag_cfg['embedding_model']}`")
+        st.markdown(f"- **Reranker:** `{rag_cfg['reranker_model']}`")
+        st.markdown(f"- **BM25 index:** {len(chunks)} chunks")

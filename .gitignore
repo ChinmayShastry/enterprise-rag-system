@@ -1,8 +1,45 @@
+# Python
 venv/
-data/
-.env
+.venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Data & documents (user-specific — never commit)
+data/
+*.pdf
+
+# Vector store (rebuilt by ingest.py — never commit)
+chroma_db/
+
+# Logs (runtime output — never commit)
+logs/
+*.jsonl
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS
 .DS_Store
 Thumbs.db
-.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Streamlit
+.streamlit/secrets.toml

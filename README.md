@@ -1,4 +1,4 @@
-# 🤖 Enterprise-Grade RAG System — Company Knowledge AI Assistant
+# 📖 DocuMind — AI Assistant for Product Manuals & Compliance Documents
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)
 ![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o--mini-412991?logo=openai)
@@ -6,317 +6,289 @@
 ![ChromaDB](https://img.shields.io/badge/VectorDB-ChromaDB-orange)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-A production-ready Retrieval-Augmented Generation (RAG) system that allows users to query company documents using natural language. Built with hybrid search, role-based access control, query rewriting, query logging, user feedback, and an evaluation dashboard.
+> **The problem:** Product manuals are dense, scanned, version-specific, and safety-critical. Compliance documents are long, clause-heavy, and legally binding. Support teams waste hours searching through them manually. A wrong answer from a generic AI about a torque spec or a compliance clause is not just unhelpful — it is dangerous.
 
-> **Not a "chat with PDF" toy.** This is an enterprise-grade GenAI backend with real retrieval engineering, access control, and observability.
+**DocuMind** is a RAG system built specifically for two document types where getting the answer wrong has real consequences — **product manuals** and **HR/compliance documents**. It retrieves answers only from your actual documents, cites exact pages, respects who is allowed to see what, and logs every query for audit purposes.
 
----
-
-## 📸 Demo
-
-| Login Screen | Chat Interface | Admin Dashboard |
-|---|---|---|
-| Role-based login | Answers with citations | Query logs + feedback metrics |
+This is not a "chat with any PDF" tool. It is an enterprise assistant built around the specific retrieval, safety, and access-control needs of technical and compliance documentation.
 
 ---
 
-## 🧠 Architecture
+## 🎯 Built for Two Specific Problems
 
-```
-PDF / Scanned Document
-        ↓
-   OCR (Tesseract)
-        ↓
-   Text Chunking (RecursiveCharacterTextSplitter)
-        ↓
-   OpenAI Embeddings (text-embedding-3-small)
-        ↓
-   ChromaDB Vector Store
-        ↓
-User Query → RBAC Check → Query Rewriter (GPT-4o-mini)
-                                    ↓
-              ┌─────────────────────────────────────┐
-              │  Vector Search    +   BM25 Search   │
-              │  (Semantic)           (Keyword)     │
-              └─────────────────────────────────────┘
-                                    ↓
-                         Deduplicated Results
-                                    ↓
-                    GPT-4o-mini → Answer + Citations
-                                    ↓
-                    👍 / 👎 Feedback → Query Logger
-                                    ↓
-                         Evaluation Dashboard
-```
+### 📦 Product Manuals
 
----
+Field technicians, support agents, and end users need fast, accurate answers from manuals that are often scanned, image-heavy, and hundreds of pages long.
 
-## ✨ Features
-
-### 🔍 Retrieval
-- **Hybrid Search** — combines ChromaDB vector search (semantic) with BM25 (keyword) for best-of-both retrieval
-- **Query Rewriting** — GPT rewrites each user query into 4 variations before searching, drastically reducing missed results
-- **Deduplication** — merges results from all query variations without repetition
-
-### 🔐 Access Control (RBAC)
-- Three user roles: `admin`, `support`, `viewer`
-- Each role has different retrieval depth and source visibility
-- Unauthenticated users cannot access the system
-
-| Role | Max Chunks | See Sources |
-|---|---|---|
-| Admin | 8 | ✅ Yes |
-| Support | 5 | ✅ Yes |
-| Viewer | 3 | ❌ Hidden |
-
-### 📋 Observability
-- Every query is logged with timestamp, username, role, question, answer, and sources
-- User feedback (👍 / 👎) saved to a separate log
-- Admin-only evaluation dashboard shows query stats, satisfaction scores, and system health
-
-### 🖥️ Frontend
-- Clean Streamlit UI with login screen, chat interface, and admin dashboard
-- Chat history preserved within session
-- Feedback buttons on every answer
-
----
-
-## 🏗️ Tech Stack
-
-| Component | Technology |
+| What users ask | What DocuMind does |
 |---|---|
-| LLM | OpenAI GPT-4o-mini |
-| Embeddings | OpenAI text-embedding-3-small |
-| Vector Store | ChromaDB |
-| Keyword Search | BM25 (rank-bm25) |
-| OCR | Tesseract + pdf2image |
-| Document Loading | LangChain |
-| Frontend | Streamlit |
-| Language | Python 3.10+ |
+| "How do I fix error code E4?" | Retrieves the exact troubleshooting section, cites the page |
+| "What is the max load for this model?" | Returns the actual specification — not a guess |
+| "Walk me through installation step by step" | Returns ordered steps with safety warnings surfaced first |
+| Support agent vs end customer need different depth | RBAC controls retrieval depth and source visibility per role |
+
+### 📋 HR & Compliance Documents
+
+HR managers, legal teams, and employees need exact policy answers with traceable citations — not paraphrased summaries that could misrepresent a clause.
+
+| What users ask | What DocuMind does |
+|---|---|
+| "What is the notice period for contract staff?" | Retrieves the exact clause, not a paraphrase |
+| "Which section covers data retention?" | Cites section number and page |
+| "Who asked what, and when?" | Every query logged — audit trail built in |
+| Sensitive HR data cannot be seen by all staff | Role-based access hides sources from lower-privilege users |
 
 ---
 
-## 📁 Project Structure
+## Why Not Just Use ChatGPT?
+
+| ChatGPT / Generic LLM | DocuMind |
+|---|---|
+| Hallucinates part numbers, torque specs, policy clauses | Answers only from your actual document — if it is not there, it says so |
+| No page citations | Every answer cites exact page numbers |
+| No knowledge of your specific product version or internal policy | Ingested per product, per document version |
+| Cannot read scanned product manuals (image PDFs) | OCR pipeline handles image-only PDFs automatically |
+| Anyone can ask anything and see everything | RBAC — field tech, support, and admin see different levels of detail |
+| No audit trail | Full query log — who asked what, when, and what answer they received |
+| Trained on public internet, may be outdated for your product | Grounded entirely in your current documentation |
+
+---
+
+## Technical Features
+
+| Feature | Details |
+|---|---|
+| **OCR Pipeline** | Auto-detects scanned PDFs and runs Tesseract — handles real-world product manuals |
+| **Hybrid Search** | ChromaDB vector search (semantic) + BM25 keyword search — best of both retrieval methods |
+| **Query Rewriting** | GPT rewrites each query into 3 variations, bridging the vocabulary gap between users and documents |
+| **Cross-Encoder Reranking** | ms-marco-MiniLM-L-6-v2 scores chunks by true relevance, not just cosine similarity |
+| **Streaming Answers** | Token-by-token streaming — no blank wait screen |
+| **RBAC** | 3 roles (admin / support / viewer) with configurable retrieval depth per role |
+| **Query Logging** | Every query, answer, user, and timestamp saved — compliance-ready audit trail |
+| **Feedback System** | Per-answer thumbs up / down, logged separately for evaluation |
+| **Evaluation Dashboard** | Satisfaction scores, usage by role, recent query review — admin only |
+| **Fully Configurable** | Title, persona, chunk settings, models — all in one YAML file, no code changes needed |
+
+---
+
+## Architecture
 
 ```
-RAG_Project/
-├── app.py                   # Main Streamlit application
-├── chroma_db/               # Persisted vector store (ChromaDB)
-├── logs/
-│   ├── query_log.jsonl      # All user queries + answers
-│   └── feedback_log.jsonl   # User feedback (useful / not useful)
-├── data/
-│   └── your_document.pdf    # Source document
-├── RAG_Phase1.ipynb         # Colab notebook (full pipeline dev)
-├── requirements.txt         # Python dependencies
-└── README.md
+PDF / Scanned Manual
+        |
+   [Auto-detect]
+   /           \
+PyPDF        OCR (Tesseract)
+        |
+  Chunking (500 chars, 100 overlap)
+        |
+  OpenAI Embeddings
+        |
+  ChromaDB  +  BM25 Index
+        |
+User Query --> RBAC Check --> Role sets retrieval depth
+        |
+  Query Rewriter (3 alternative phrasings)
+        |
+  Hybrid Search (Vector + BM25, all 4 queries)
+        |
+  Deduplicate
+        |
+  Cross-Encoder Reranker
+        |
+  Top-N Chunks (per role limit)
+        |
+  GPT-4o-mini (streaming)
+        |
+  Answer + Page Citations
+  /               \
+Query Log       Feedback Log
+        \           /
+       Admin Dashboard
 ```
 
 ---
 
-## 🚀 Getting Started
-
-### 1. Clone the repository
+## Quick Start
 
 ```bash
-git clone https://github.com/your-username/enterprise-rag-system.git
+# 1. Clone and install
+git clone https://github.com/ChinmayShastry/enterprise-rag-system.git
 cd enterprise-rag-system
-```
-
-### 2. Create and activate virtual environment
-
-```bash
-python -m venv venv
-
-# Windows
-venv\Scripts\activate
-
-# Mac/Linux
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
 pip install -r requirements.txt
-```
 
-### 4. Set your OpenAI API key
+# 2. Set your API key
+cp .env.example .env
+# Open .env and add: OPENAI_API_KEY=sk-your-key-here
 
-Open `app.py` and replace:
+# 3. Ingest your document
+python scripts/ingest.py --pdf data/your_manual.pdf
 
-```python
-OPENAI_API_KEY = "your-openai-api-key-here"
-```
-
-> 💡 Tip: Use environment variables in production — never hardcode API keys.
-
-### 5. Add your document and build the vector store
-
-If you want to use your own PDF, run the Colab notebook `RAG_Phase1.ipynb` end-to-end. It will:
-- OCR your PDF (if scanned)
-- Chunk the text
-- Generate embeddings
-- Save the ChromaDB vector store to Google Drive
-
-Then download `chroma_db/` from Drive and place it in the project root.
-
-### 6. Run the app
-
-```bash
+# 4. Run
 streamlit run app.py
 ```
 
-Open `http://localhost:8501` in your browser.
+Open `http://localhost:8501`. Log in with any demo account and start asking questions.
 
 ---
 
-## 👤 Demo Accounts
+## Adapting to Your Document
 
-| Username | Password | Role |
-|---|---|---|
-| alice | alice123 | admin |
-| bob | bob123 | support |
-| guest | guest123 | viewer |
+Everything lives in `config/config.yaml` — no code changes needed.
 
----
+**For a product manual:**
+```yaml
+app:
+  title: "Bosch Dishwasher Support Assistant"
+  icon: "🍽️"
+  persona: "a support assistant for Bosch dishwasher product manuals"
+  description: "Ask anything about installation, troubleshooting, and maintenance."
 
-## 📦 Requirements
-
-```
-openai
-chromadb
-pypdf
-langchain
-langchain-community
-langchain-openai
-tiktoken
-sentence-transformers
-rank_bm25
-streamlit
-pytesseract
-pdf2image
-pymupdf
+rag:
+  collection_name: "bosch_dishwasher_manual"
+  chunk_size: 500
+  chunk_overlap: 100
 ```
 
-Install all at once:
+**For an HR policy document:**
+```yaml
+app:
+  title: "Acme HR Policy Assistant"
+  icon: "📋"
+  persona: "an HR assistant for Acme company policies and compliance documents"
+  description: "Ask about leave policies, compliance procedures, and employee guidelines."
+
+rag:
+  collection_name: "acme_hr_policies"
+  chunk_size: 600
+  chunk_overlap: 150
+```
+
+Switch documents by updating the config and re-ingesting:
 
 ```bash
-pip install openai chromadb pypdf langchain langchain-community langchain-openai tiktoken sentence-transformers rank_bm25 streamlit pytesseract pdf2image pymupdf
+python scripts/ingest.py --pdf data/new_document.pdf --reset
 ```
 
 ---
 
-## 🔬 How It Works — Deep Dive
+## Ingestion Options
 
-### Step 1: Document Ingestion
-The system uses `pdf2image` + Tesseract OCR to extract text from scanned PDFs. Text-based PDFs are handled by `PyPDFLoader`. Each page is converted to a `Document` object with metadata (page number, source).
+```bash
+# Standard — auto-detects text vs scanned
+python scripts/ingest.py --pdf data/manual.pdf
 
-### Step 2: Chunking
-Documents are split using `RecursiveCharacterTextSplitter` with:
-- `chunk_size = 500` characters
-- `chunk_overlap = 100` characters (ensures context continuity across chunks)
-- Split priority: paragraph → line → sentence → word
+# Force OCR for scanned or image-heavy PDFs
+python scripts/ingest.py --pdf data/scanned_manual.pdf --ocr
 
-### Step 3: Embeddings + Vector Store
-All chunks are embedded using OpenAI's `text-embedding-3-small` model and stored in ChromaDB. The vector store is persisted to disk so re-embedding is not required on restart.
+# Replace existing collection with a new version
+python scripts/ingest.py --pdf data/manual_v2.pdf --reset
+```
 
-### Step 4: Query Pipeline
-
-When a user submits a question:
-
-1. **RBAC check** — verify user role and permissions
-2. **Query rewriting** — GPT generates 3 alternative phrasings of the question
-3. **Hybrid search** — run all 4 queries (original + 3 rewrites) through:
-   - ChromaDB vector search (semantic similarity)
-   - BM25 keyword search (exact term matching)
-4. **Deduplication** — merge all results, remove duplicates
-5. **Answer generation** — top chunks are passed to GPT-4o-mini as context
-6. **Logging** — query, answer, user info, and sources saved to JSONL log
-
-### Why Hybrid Search?
-Vector search is great for semantic similarity ("machine shaking") but misses exact keyword matches. BM25 is great for exact terms but misses synonyms. Combining both gives the best retrieval coverage — this is what production RAG systems like Elasticsearch use.
-
-### Why Query Rewriting?
-Users often phrase questions differently from how documents are written. A user asks "vibrating too much" but the manual says "not installed on a level floor." Query rewriting generates alternative phrasings using GPT before searching, bridging this vocabulary gap.
+The script automatically falls back to OCR if text extraction returns mostly empty pages — common with older product manuals.
 
 ---
 
-## 📊 Evaluation Dashboard (Admin Only)
+## Roles and Access Control
 
-The admin dashboard shows:
-- Total queries logged
-- Total feedback received
-- 👍 Useful vs 👎 Not useful counts
-- Overall satisfaction score (%)
-- Last 10 queries with full details (expandable)
-- System health (vector DB size, models used, log file paths)
+Defined in `config/users.yaml` and `config/config.yaml`.
+
+| Role | Chat | Dashboard | Retrieval depth | See page citations |
+|---|---|---|---|---|
+| `admin` | Yes | Yes | 5 chunks from 8 candidates | Yes |
+| `support` | Yes | No | 3 chunks from 5 candidates | Yes |
+| `viewer` | Yes | No | 2 chunks from 3 candidates | No |
+
+**Why does retrieval depth matter?**
+An admin or support agent debugging a complaint needs full context. An end customer asking a basic question needs a clean, focused answer — not 8 overlapping chunks of manual text. Role-based depth controls both answer quality and information exposure.
+
+> For production: replace plain-text passwords in `users.yaml` with a proper identity provider (Auth0, Cognito, LDAP).
 
 ---
 
-## 🗺️ Development Phases
+## How the Retrieval Pipeline Works
+
+### The vocabulary gap problem
+
+A user asks: *"machine is shaking badly"*
+The manual says: *"excessive vibration during spin cycle — check levelling feet"*
+
+Same meaning, zero shared keywords. Pure vector search catches this. Pure keyword search (BM25) misses it entirely.
+
+But if a user asks: *"error code E4"* — an exact code — vector search may drift to semantically similar but wrong results. BM25 catches exact codes reliably.
+
+Hybrid search runs both and merges results, giving strong recall for both semantic and keyword queries.
+
+### Query rewriting
+
+Before searching, GPT generates 3 alternative phrasings. All 4 variations run through hybrid search. This closes the gap between casual user language and formal technical document language.
+
+### Cross-encoder reranking
+
+After retrieval, 20+ chunks may be returned. A cross-encoder model reads the question and each chunk together — the way a human would — and assigns a proper relevance score. Only the top-N per role go to the LLM. This is the step that most "chat with PDF" tools skip, and it is what directly reduces hallucination by cutting noisy context.
+
+---
+
+## Project Structure
+
+```
+enterprise-rag-system/
+├── app.py                    # Streamlit frontend
+├── rag/
+│   ├── __init__.py
+│   ├── auth.py               # Authentication and RBAC
+│   ├── retrieval.py          # Hybrid search and reranking
+│   ├── generation.py         # Streaming answer generation
+│   └── logger.py             # Query and feedback logging
+├── scripts/
+│   └── ingest.py             # PDF ingestion pipeline (run once per document)
+├── config/
+│   ├── config.yaml           # App config, RAG settings, role permissions
+│   └── users.yaml            # User credentials and roles
+├── notebooks/
+│   └── RAG_development.ipynb # Development notebook (Phases 1-4)
+├── logs/                     # gitignored — created at runtime
+├── data/                     # gitignored — put your PDF here
+├── chroma_db/                # Vector store — committed for demo deployment
+├── .env.example              # Copy to .env, add your API key
+├── .gitignore
+├── requirements.txt
+└── packages.txt              # System deps for Streamlit Cloud
+```
+
+---
+
+## Development Phases
 
 | Phase | What was built |
 |---|---|
-| Phase 1 | OCR pipeline, chunking, embeddings, ChromaDB, basic RAG with citations |
-| Phase 2 | Query rewriting, hybrid search (Vector + BM25), hallucination reduction |
-| Phase 3 | RBAC login system, role-controlled retrieval, query logging |
-| Phase 4 | User feedback system, evaluation dashboard, Streamlit frontend |
+| Phase 1 | OCR pipeline, chunking, OpenAI embeddings, ChromaDB, basic RAG with page citations |
+| Phase 2 | Query rewriting (3 variations), hybrid search (vector + BM25), retrieval recall improvements |
+| Phase 3 | RBAC login system, role-controlled retrieval depth, query logging to JSONL |
+| Phase 4 | Cross-encoder reranking, streaming answers, feedback system, evaluation dashboard |
+| Phase 5 | Modular refactor (rag/ package), config-driven design, standalone ingest.py script |
 
 ---
 
-## 🧪 Example Queries
+## Roadmap
 
-```
-"How do I clean the filter?"
-→ Step-by-step cleaning instructions (Page 31)
-
-"What should I do if the machine is vibrating too much?"
-→ Check fixing bolts and floor leveling (Page 34)
-
-"What washing programs are available?"
-→ Full list: Cotton, Synthetic, Wool, ECO 40-60, Steam Treat... (Page 25)
-```
+- [ ] Multi-document support — query across your entire product catalog, filter by product
+- [ ] Safety warning pinning — chunks with WARNING or CAUTION always surface first
+- [ ] Document versioning — tag manuals by product model and version, prevent cross-version bleed
+- [ ] RAGAS evaluation — automated faithfulness, answer relevance, and context precision scoring
+- [ ] FastAPI backend — decouple retrieval from Streamlit for API access by other systems
+- [ ] Docker deployment — single command local or cloud setup
+- [ ] JWT authentication — replace the YAML credential system
 
 ---
 
-## 🔮 Future Improvements
+## Author
 
-- [ ] FastAPI backend (decouple frontend and retrieval logic)
-- [ ] Multi-document support with document-level access control
-- [ ] Elasticsearch integration for production-grade BM25
-- [ ] Graph RAG for multi-hop reasoning across documents
-- [ ] LLM evaluation metrics (faithfulness, answer relevance, context precision)
-- [ ] Docker containerization for deployment
-- [ ] JWT-based authentication (replace hardcoded users)
-- [ ] Upload new documents via UI without re-running notebook
+**Chinmay Shastry** — Bengaluru, India
+[GitHub](https://github.com/ChinmayShastry)
 
 ---
 
-## 🎯 Why This Project Matters
+## License
 
-Most RAG tutorials build a basic "chat with PDF" using a 10-line LangChain chain. This project goes further:
-
-| What tutorials show | What this project builds |
-|---|---|
-| Basic vector search | Hybrid search (vector + BM25) |
-| One query per search | Query rewriting (4 variations) |
-| No access control | RBAC with 3 roles |
-| No logging | Full query + feedback logging |
-| No observability | Admin evaluation dashboard |
-| Notebook only | Deployed Streamlit app |
-
-This reflects how RAG systems are actually built and deployed in production.
-
----
-
-## 👨‍💻 Author
-
-**Chinmay**
-- 📍 Bengaluru, India
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License.
+MIT
