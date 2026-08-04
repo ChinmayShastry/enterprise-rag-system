@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from langchain_core.documents import Document
 
+from rag.access import AccessPolicy, unlabelled
 from rag.settings import Settings
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -64,6 +65,15 @@ class Retriever:
     def chunk_count(self) -> int:
         return len(self.chunks)
 
+    @property
+    def unlabelled_count(self) -> int:
+        """
+        Chunks with no classification label. They are invisible to every role,
+        so a non-zero count here means part of the index was ingested before
+        labelling and needs re-ingesting.
+        """
+        return len(unlabelled(self.chunks))
+
     # ── query rewriting ──────────────────────────────────────────
 
     def rewrite_query(self, question: str) -> list[str]:
@@ -93,27 +103,45 @@ class Retriever:
 
     # ── hybrid search ────────────────────────────────────────────
 
-    def search(self, question: str, k: int = 5) -> list[Document]:
+    def search(self, question: str, k: int, *, policy: AccessPolicy) -> list[Document]:
         """
         Run all query variations (original + 3 rewrites) through both
         vector search and BM25 keyword search, then deduplicate.
         The union of both methods gives better recall than either alone.
+
+        `policy` is required, not optional — an unfiltered search is never the
+        right default, and a keyword argument makes every call site declare
+        whose access it is running under.
         """
+        if policy.denies_everything:
+            return []
+
+        where = policy.where_clause()
         queries = self.rewrite_query(question)
         queries.append(question)  # Always include the original
 
         seen: dict[str, Document] = {}
 
         for query in queries:
-            for doc in self.vectorstore.similarity_search(query, k=k):
+            # Filtered inside the vector store, so denied chunks never leave it.
+            for doc in self.vectorstore.similarity_search(query, k=k, filter=where):
                 seen.setdefault(doc.page_content[:120], doc)
 
+            # BM25 searches an in-memory list that Chroma's filter cannot reach,
+            # so clearance is applied here while picking the top k. Denied chunks
+            # are skipped rather than consuming a slot, so a viewer still gets k
+            # results from the documents they are allowed to see.
             if self.chunks:
                 scores = self.bm25.get_scores(query.lower().split())
-                for idx in scores.argsort()[::-1][:k]:
-                    if scores[idx] > 0:
-                        chunk = self.chunks[idx]
-                        seen.setdefault(chunk.page_content[:120], chunk)
+                taken = 0
+                for idx in scores.argsort()[::-1]:
+                    if taken >= k or scores[idx] <= 0:
+                        break  # scores descend; nothing better remains
+                    chunk = self.chunks[idx]
+                    if not policy.permits(chunk):
+                        continue
+                    seen.setdefault(chunk.page_content[:120], chunk)
+                    taken += 1
 
         return list(seen.values())
 
@@ -146,9 +174,19 @@ class Retriever:
         *,
         max_results: int,
         top_n: int,
+        policy: AccessPolicy,
     ) -> list[Document]:
-        """Search then rerank — the whole retrieval path in one call."""
-        return self.rerank(question, self.search(question, k=max_results), top_n=top_n)
+        """
+        Search then rerank — the whole retrieval path in one call.
+
+        The final policy.filter() is deliberate redundancy: both search paths
+        already enforce clearance, so this should never drop anything. It is
+        the backstop that keeps a future bug in either path from putting an
+        unauthorised chunk in front of the LLM.
+        """
+        candidates = self.search(question, k=max_results, policy=policy)
+        ranked = self.rerank(question, candidates, top_n=top_n)
+        return policy.filter(ranked)
 
 
 # ─────────────────────────────────────────────────────────────────

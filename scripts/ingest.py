@@ -29,6 +29,13 @@ from rag.settings import ConfigError, Settings, load_settings
 
 load_dotenv()
 
+# Windows consoles default to cp1252, which cannot encode the emoji in this
+# script's output — without this, a status line raises UnicodeEncodeError and
+# masks the actual result.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Ingest a PDF into ChromaDB.")
@@ -36,6 +43,12 @@ def parse_args():
     parser.add_argument("--ocr", action="store_true", help="Force OCR extraction")
     parser.add_argument("--reset", action="store_true", help="Wipe existing collection first")
     parser.add_argument("--config", default=None, help="Path to config.yaml")
+    parser.add_argument(
+        "--classification",
+        default=None,
+        help="Security label for this document (default: rag.default_classification). "
+             "Roles retrieve only the classifications they are cleared for.",
+    )
     return parser.parse_args()
 
 
@@ -83,6 +96,18 @@ def has_text(pages: list) -> bool:
     """Heuristic: if most pages have content, skip OCR."""
     non_empty = sum(1 for p in pages if len(p.page_content.strip()) > 50)
     return non_empty / max(len(pages), 1) > 0.5
+
+
+def label_chunks(chunks: list, classification: str) -> list:
+    """
+    Stamp every chunk with its security label.
+
+    This is what makes role clearance enforceable at query time — an unlabelled
+    chunk is retrievable by nobody, so labelling is not optional.
+    """
+    for chunk in chunks:
+        chunk.metadata["classification"] = classification
+    return chunks
 
 
 def chunk_documents(pages: list, chunk_size: int, chunk_overlap: int) -> list:
@@ -149,6 +174,19 @@ def main():
         sys.exit(1)
     rag_cfg = settings.rag
 
+    # Resolve and validate the security label before spending money on embeddings
+    classification = args.classification or rag_cfg.default_classification
+    if classification not in settings.classifications:
+        print(
+            f"❌  Unknown classification '{classification}'. "
+            f"Declared classifications are: {', '.join(settings.classifications)}"
+        )
+        sys.exit(1)
+
+    cleared = sorted(
+        name for name, perms in settings.roles.items() if classification in perms.clearance
+    )
+
     # Resolve API key
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -160,7 +198,9 @@ def main():
     print(f"\n📄  Ingesting: {pdf_path.name}")
     print(f"    Collection : {rag_cfg.collection_name}")
     print(f"    Chunk size : {rag_cfg.chunk_size} chars (overlap {rag_cfg.chunk_overlap})")
-    print(f"    Vector store: {rag_cfg.chroma_path}\n")
+    print(f"    Vector store: {rag_cfg.chroma_path}")
+    print(f"    Classification: {classification}")
+    print(f"    Retrievable by: {', '.join(cleared) if cleared else '⚠️  no role'}\n")
 
     # Step 1: Extract text
     if args.ocr:
@@ -174,8 +214,9 @@ def main():
         else:
             print(f"✅  Extracted text from {len(pages)} pages via PyPDF.")
 
-    # Step 2: Chunk
+    # Step 2: Chunk and label
     chunks = chunk_documents(pages, rag_cfg.chunk_size, rag_cfg.chunk_overlap)
+    chunks = label_chunks(chunks, classification)
 
     # Step 3: Embed + store
     embed_and_store(chunks, settings, api_key, reset=args.reset)

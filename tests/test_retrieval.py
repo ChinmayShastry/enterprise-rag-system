@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from langchain_core.documents import Document
 
+from rag.access import AccessPolicy
 from rag.retrieval import Retriever
 
 
@@ -32,13 +33,32 @@ class FakeClient:
 
 
 class FakeVectorStore:
+    """
+    Stands in for Chroma, and honours the metadata filter the way Chroma does.
+
+    Applying the filter here matters: if this fake ignored it, the RBAC tests
+    would pass on the post-retrieval backstop alone and a broken where-clause
+    would go unnoticed.
+    """
+
     def __init__(self, docs: list[Document]):
         self.docs = docs
         self.queries: list[tuple[str, int]] = []
+        self.filters: list[dict | None] = []
 
-    def similarity_search(self, query: str, k: int = 5) -> list[Document]:
+    def similarity_search(
+        self, query: str, k: int = 5, filter: dict | None = None
+    ) -> list[Document]:
         self.queries.append((query, k))
-        return self.docs[:k]
+        self.filters.append(filter)
+
+        candidates = self.docs
+        if filter:
+            allowed = filter["classification"]["$in"]
+            candidates = [
+                d for d in candidates if d.metadata.get("classification") in allowed
+            ]
+        return candidates[:k]
 
 
 class FakeBM25:
@@ -62,8 +82,14 @@ class FakeReranker:
 REWRITES = "1. alternative one\n2. alternative two\n3. alternative three"
 
 
-def make_docs(*texts: str) -> list[Document]:
-    return [Document(page_content=t, metadata={"page": i + 1}) for i, t in enumerate(texts)]
+def make_docs(*texts: str, classification: str = "public") -> list[Document]:
+    return [
+        Document(
+            page_content=t,
+            metadata={"page": i + 1, "classification": classification},
+        )
+        for i, t in enumerate(texts)
+    ]
 
 
 def build(settings, *, docs=None, bm25_scores=None, rewrite=REWRITES) -> Retriever:
@@ -76,6 +102,11 @@ def build(settings, *, docs=None, bm25_scores=None, rewrite=REWRITES) -> Retriev
         reranker=FakeReranker(),
         settings=settings,
     )
+
+
+@pytest.fixture
+def admin(settings):
+    return AccessPolicy.for_role("admin", settings)
 
 
 # ── query rewriting ──────────────────────────────────────────────
@@ -99,33 +130,33 @@ def test_rewrite_query_uses_configured_model(settings):
 # ── hybrid search ────────────────────────────────────────────────
 
 
-def test_search_includes_the_original_question(settings):
+def test_search_includes_the_original_question(settings, admin):
     retriever = build(settings)
-    retriever.search("my question", k=2)
+    retriever.search("my question", k=2, policy=admin)
     assert "my question" in [q for q, _ in retriever.vectorstore.queries]
 
 
-def test_search_runs_every_variation(settings):
+def test_search_runs_every_variation(settings, admin):
     retriever = build(settings)
-    retriever.search("my question", k=2)
+    retriever.search("my question", k=2, policy=admin)
     # 3 rewrites + the original
     assert len(retriever.vectorstore.queries) == 4
 
 
-def test_search_honours_k(settings):
+def test_search_honours_k(settings, admin):
     retriever = build(settings)
-    retriever.search("q", k=1)
+    retriever.search("q", k=1, policy=admin)
     assert {k for _, k in retriever.vectorstore.queries} == {1}
 
 
-def test_search_deduplicates_repeated_hits(settings):
+def test_search_deduplicates_repeated_hits(settings, admin):
     docs = make_docs("shared chunk", "other chunk")
     retriever = build(settings, docs=docs)
-    results = retriever.search("q", k=2)
+    results = retriever.search("q", k=2, policy=admin)
     assert len(results) == 2  # not 8, despite 4 query variations
 
 
-def test_bm25_hits_are_merged_in(settings):
+def test_bm25_hits_are_merged_in(settings, admin):
     docs = make_docs("vector only", "keyword only")
     retriever = Retriever(
         client=FakeClient(REWRITES),
@@ -135,11 +166,11 @@ def test_bm25_hits_are_merged_in(settings):
         reranker=FakeReranker(),
         settings=settings,
     )
-    contents = {d.page_content for d in retriever.search("q", k=1)}
+    contents = {d.page_content for d in retriever.search("q", k=1, policy=admin)}
     assert contents == {"vector only", "keyword only"}
 
 
-def test_zero_scoring_bm25_hits_are_ignored(settings):
+def test_zero_scoring_bm25_hits_are_ignored(settings, admin):
     docs = make_docs("vector only", "never matched")
     retriever = Retriever(
         client=FakeClient(REWRITES),
@@ -149,7 +180,9 @@ def test_zero_scoring_bm25_hits_are_ignored(settings):
         reranker=FakeReranker(),
         settings=settings,
     )
-    assert [d.page_content for d in retriever.search("q", k=1)] == ["vector only"]
+    assert [d.page_content for d in retriever.search("q", k=1, policy=admin)] == [
+        "vector only"
+    ]
 
 
 # ── reranking ────────────────────────────────────────────────────
@@ -179,28 +212,33 @@ def test_rerank_top_n_larger_than_input_is_safe(settings):
 def test_retrieve_respects_role_depth(settings):
     docs = make_docs("torque a", "torque b", "torque c", "unrelated")
     retriever = build(settings, docs=docs)
-    viewer = settings.permissions_for("viewer")
+    perms = settings.permissions_for("viewer")
 
     result = retriever.retrieve(
-        "torque", max_results=viewer.max_results, top_n=viewer.top_n_rerank
+        "torque",
+        max_results=perms.max_results,
+        top_n=perms.top_n_rerank,
+        policy=AccessPolicy.for_role("viewer", settings),
     )
-    assert len(result) == viewer.top_n_rerank == 2
+    assert len(result) == perms.top_n_rerank == 2
 
 
 def test_admin_gets_more_context_than_viewer(settings):
     docs = make_docs(*[f"torque chunk {i}" for i in range(8)])
     retriever = build(settings, docs=docs)
 
-    admin = settings.permissions_for("admin")
-    viewer = settings.permissions_for("viewer")
+    def depth(role: str) -> int:
+        perms = settings.permissions_for(role)
+        return len(
+            retriever.retrieve(
+                "torque",
+                max_results=perms.max_results,
+                top_n=perms.top_n_rerank,
+                policy=AccessPolicy.for_role(role, settings),
+            )
+        )
 
-    admin_docs = retriever.retrieve(
-        "torque", max_results=admin.max_results, top_n=admin.top_n_rerank
-    )
-    viewer_docs = retriever.retrieve(
-        "torque", max_results=viewer.max_results, top_n=viewer.top_n_rerank
-    )
-    assert len(admin_docs) > len(viewer_docs)
+    assert depth("admin") > depth("viewer")
 
 
 def test_chunk_count_reports_index_size(settings):
@@ -208,7 +246,7 @@ def test_chunk_count_reports_index_size(settings):
     assert retriever.chunk_count == 3
 
 
-def test_empty_index_yields_no_results(settings):
+def test_empty_index_yields_no_results(settings, admin):
     retriever = Retriever(
         client=FakeClient(REWRITES),
         vectorstore=FakeVectorStore([]),
@@ -218,4 +256,4 @@ def test_empty_index_yields_no_results(settings):
         settings=settings,
     )
     assert retriever.chunk_count == 0
-    assert retriever.retrieve("q", max_results=5, top_n=3) == []
+    assert retriever.retrieve("q", max_results=5, top_n=3, policy=admin) == []

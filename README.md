@@ -86,11 +86,12 @@ PyPDF        OCR (Tesseract)
         |
   ChromaDB  +  BM25 Index
         |
-User Query --> RBAC Check --> Role sets retrieval depth
+User Query --> RBAC Check --> Role clearance + retrieval depth
         |
   Query Rewriter (3 alternative phrasings)
         |
   Hybrid Search (Vector + BM25, all 4 queries)
+  clearance filter applied inside BOTH paths
         |
   Deduplicate
         |
@@ -183,7 +184,16 @@ python scripts/ingest.py --pdf data/scanned_manual.pdf --ocr
 
 # Replace existing collection with a new version
 python scripts/ingest.py --pdf data/manual_v2.pdf --reset
+
+# Label the document so only cleared roles can retrieve it
+python scripts/ingest.py --pdf data/handbook.pdf --classification confidential
 ```
+
+Every chunk is labelled. Without `--classification` the document takes
+`rag.default_classification` from `config.yaml` (`internal` as shipped —
+deliberately not the most permissive value, so an unthinking ingestion does not
+publish a document to everyone). The script prints which roles will be able to
+retrieve what you just ingested.
 
 The script automatically falls back to OCR if text extraction returns mostly empty pages — common with older product manuals.
 
@@ -193,14 +203,36 @@ The script automatically falls back to OCR if text extraction returns mostly emp
 
 Defined in `config/users.yaml` and `config/config.yaml`.
 
-| Role | Chat | Dashboard | Retrieval depth | See page citations |
-|---|---|---|---|---|
-| `admin` | Yes | Yes | 5 chunks from 8 candidates | Yes |
-| `support` | Yes | No | 3 chunks from 5 candidates | Yes |
-| `viewer` | Yes | No | 2 chunks from 3 candidates | No |
+| Role | Chat | Dashboard | Clearance | Retrieval depth | See page citations |
+|---|---|---|---|---|---|
+| `admin` | Yes | Yes | public, internal, confidential | 5 chunks from 8 candidates | Yes |
+| `support` | Yes | No | public, internal | 3 chunks from 5 candidates | Yes |
+| `viewer` | Yes | No | public | 2 chunks from 3 candidates | No |
 
-**Why does retrieval depth matter?**
-An admin or support agent debugging a complaint needs full context. An end customer asking a basic question needs a clean, focused answer — not 8 overlapping chunks of manual text. Role-based depth controls both answer quality and information exposure.
+**Clearance is the access boundary.** Every chunk is labelled with a
+classification at ingestion time, and a role can only retrieve the labels it is
+cleared for. A `viewer` asking about severance terms does not get a filtered
+answer — the confidential chunks are never retrieved in the first place.
+
+Enforcement happens in three places:
+
+1. Inside the ChromaDB query, via a metadata filter, so denied chunks never
+   leave the vector store.
+2. While selecting BM25 candidates, which search an in-memory list the vector
+   store's filter cannot reach. Miss this and keyword search becomes a bypass.
+3. Once more on the final set before it reaches the LLM — redundant by design,
+   so a future bug in either path cannot leak a chunk into the prompt.
+
+Deny-by-default throughout: a chunk with no label, or an unrecognised one, is
+retrievable by nobody. A role missing from `config.yaml` is cleared for nothing.
+A misspelt clearance entry raises `ConfigError` at startup rather than silently
+granting nothing.
+
+**Retrieval depth is not a security control.** `max_results` and `top_n_rerank`
+tune how much context a role gets from documents it is *already* allowed to see
+— an admin debugging a complaint needs more context than an end customer asking
+a basic question. Depth alone was the old access model, and it protected
+nothing.
 
 > For production: replace plain-text passwords in `users.yaml` with a proper identity provider (Auth0, Cognito, LDAP).
 
@@ -237,6 +269,7 @@ enterprise-rag-system/
 ├── rag/                      # Framework-free package: no UI imports anywhere
 │   ├── __init__.py
 │   ├── settings.py           # Typed config + path resolution
+│   ├── access.py             # AccessPolicy — which documents a role may retrieve
 │   ├── auth.py               # Authentication and role lookup
 │   ├── retrieval.py          # Retriever: hybrid search and reranking
 │   ├── generation.py         # Streaming and blocking answer generation
@@ -310,6 +343,7 @@ pytest
 | Phase 4 | Cross-encoder reranking, streaming answers, feedback system, evaluation dashboard |
 | Phase 5 | Modular refactor (rag/ package), config-driven design, standalone ingest.py script |
 | Phase 6 | Decoupled `rag/` from Streamlit — typed settings, CWD-independent paths, injectable dependencies, headless CLI, pytest suite |
+| Phase 7 | Document-level RBAC — classification labels at ingest, per-role clearance enforced inside both search paths, deny-by-default, config validated at startup |
 
 ---
 

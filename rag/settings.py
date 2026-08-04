@@ -73,6 +73,10 @@ class AppConfig:
     description: str
 
 
+# Used when config.yaml predates the security section.
+DEFAULT_CLASSIFICATIONS: tuple[str, ...] = ("public", "internal", "confidential")
+
+
 @dataclass(frozen=True)
 class RagConfig:
     collection_name: str
@@ -82,6 +86,7 @@ class RagConfig:
     embedding_model: str
     llm_model: str
     reranker_model: str
+    default_classification: str
 
 
 @dataclass(frozen=True)
@@ -90,6 +95,9 @@ class RolePermissions:
     can_see_sources: bool
     max_results: int
     top_n_rerank: int
+    # The real access boundary: which document classifications this role may
+    # retrieve. An empty set means the role can retrieve nothing.
+    clearance: frozenset[str]
 
 
 # Deny-by-default. Any role missing from config.yaml gets this rather than
@@ -99,6 +107,7 @@ RESTRICTED = RolePermissions(
     can_see_sources=False,
     max_results=2,
     top_n_rerank=1,
+    clearance=frozenset(),
 )
 
 
@@ -107,6 +116,7 @@ class Settings:
     app: AppConfig
     rag: RagConfig
     roles: dict[str, RolePermissions]
+    classifications: tuple[str, ...]
     source_path: Path
 
     def permissions_for(self, role: str) -> RolePermissions:
@@ -158,6 +168,17 @@ def load_settings(path: str | os.PathLike | None = None) -> Settings:
     # mounted volume without editing the file.
     chroma_raw = os.getenv("CHROMA_PATH") or rag_raw.get("chroma_path", "./chroma_db")
 
+    classifications = tuple(
+        (raw.get("security") or {}).get("classifications") or DEFAULT_CLASSIFICATIONS
+    )
+
+    default_classification = rag_raw.get("default_classification", classifications[-1])
+    if default_classification not in classifications:
+        raise ConfigError(
+            f"rag.default_classification '{default_classification}' is not one of "
+            f"the declared classifications {list(classifications)}"
+        )
+
     rag = RagConfig(
         collection_name=_require(rag_raw, "collection_name", "rag"),
         chroma_path=resolve_path(chroma_raw),
@@ -166,6 +187,7 @@ def load_settings(path: str | os.PathLike | None = None) -> Settings:
         embedding_model=_require(rag_raw, "embedding_model", "rag"),
         llm_model=_require(rag_raw, "llm_model", "rag"),
         reranker_model=_require(rag_raw, "reranker_model", "rag"),
+        default_classification=default_classification,
     )
 
     roles = {
@@ -174,11 +196,47 @@ def load_settings(path: str | os.PathLike | None = None) -> Settings:
             can_see_sources=bool(spec.get("can_see_sources", False)),
             max_results=int(spec.get("max_results", RESTRICTED.max_results)),
             top_n_rerank=int(spec.get("top_n_rerank", RESTRICTED.top_n_rerank)),
+            clearance=frozenset(spec.get("clearance") or ()),
         )
         for name, spec in (roles_raw or {}).items()
     }
 
-    return Settings(app=app, rag=rag, roles=roles, source_path=resolved)
+    _validate_clearances(roles, classifications)
+
+    return Settings(
+        app=app,
+        rag=rag,
+        roles=roles,
+        classifications=classifications,
+        source_path=resolved,
+    )
+
+
+def _validate_clearances(
+    roles: dict[str, RolePermissions],
+    classifications: tuple[str, ...],
+) -> None:
+    """
+    Catch access-control typos at startup rather than in production.
+
+    A misspelt clearance entry would otherwise silently grant nothing, and a
+    queryable role with no clearance would silently return zero results — both
+    look like retrieval bugs rather than config mistakes.
+    """
+    known = set(classifications)
+    for name, perms in roles.items():
+        unknown = perms.clearance - known
+        if unknown:
+            raise ConfigError(
+                f"Role '{name}' is cleared for unknown classification(s) "
+                f"{sorted(unknown)}; declared classifications are {list(classifications)}"
+            )
+        if perms.can_query and not perms.clearance:
+            raise ConfigError(
+                f"Role '{name}' has can_query: true but an empty clearance list, "
+                f"so it could never retrieve anything. Grant it a clearance or "
+                f"set can_query: false."
+            )
 
 
 @lru_cache(maxsize=8)

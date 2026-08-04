@@ -25,10 +25,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dotenv import load_dotenv
 
+from rag.access import AccessPolicy
 from rag.generation import generate_answer, get_sources
 from rag.settings import ConfigError, load_settings
 
 load_dotenv()
+
+# Windows consoles default to cp1252 and cannot encode this script's emoji
+# output; without this a status line raises UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def parse_args():
@@ -78,11 +85,23 @@ def main() -> int:
         print("❌  No documents indexed. Run scripts/ingest.py first.", file=sys.stderr)
         return 1
 
+    policy = AccessPolicy.from_permissions(args.role, permissions)
     docs = retriever.retrieve(
         args.question,
         max_results=permissions.max_results,
         top_n=permissions.top_n_rerank,
+        policy=policy,
     )
+
+    if not docs:
+        clearance = ", ".join(sorted(policy.clearance)) or "none"
+        print(
+            f"No documents matching the '{args.role}' clearance ({clearance}) "
+            f"contain an answer to that question.",
+            file=sys.stderr,
+        )
+        return 3
+
     answer = generate_answer(
         retriever.client,
         args.question,

@@ -11,6 +11,7 @@ Only the lightweight modules are re-exported here. `rag.retrieval` and
     from rag.generation import generate_answer
 """
 
+from rag.access import AccessPolicy
 from rag.auth import User, authenticate, authorize_query, load_users
 from rag.logger import QueryLog
 from rag.settings import (
@@ -24,6 +25,7 @@ from rag.settings import (
 
 __all__ = [
     "PROJECT_ROOT",
+    "AccessPolicy",
     "ConfigError",
     "QueryLog",
     "RolePermissions",

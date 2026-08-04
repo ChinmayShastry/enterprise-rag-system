@@ -16,6 +16,7 @@ import uuid
 import streamlit as st
 from dotenv import load_dotenv
 
+from rag.access import AccessPolicy
 from rag.auth import User, authenticate, authorize_query
 from rag.generation import get_sources, stream_answer
 from rag.logger import QueryLog
@@ -144,6 +145,7 @@ if not user:
     st.rerun()
 
 permissions = settings.permissions_for(user.role)
+policy = AccessPolicy.from_permissions(user.role, permissions)
 
 # config.yaml has always defined can_query per role — now it is enforced.
 if not authorize_query(user, settings):
@@ -168,12 +170,22 @@ if retriever.chunk_count == 0:
     )
     st.stop()
 
+# Unlabelled chunks are retrievable by nobody, so say so loudly rather than
+# letting them look like a retrieval failure.
+if retriever.unlabelled_count:
+    st.warning(
+        f"⚠️ {retriever.unlabelled_count} of {retriever.chunk_count} indexed chunks "
+        "have no classification label and are invisible to every role. "
+        "Re-ingest with `--reset` to label them."
+    )
+
 # ── Sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
     st.title(f"{app_cfg.icon} {app_cfg.title}")
     st.divider()
     st.markdown(f"**{user.display_name}**")
     st.caption(f"Role: `{user.role}`")
+    st.caption(f"Clearance: {', '.join(f'`{c}`' for c in sorted(policy.clearance))}")
     st.caption(f"Retrieval depth: {permissions.top_n_rerank} chunks")
     st.divider()
 
@@ -245,6 +257,14 @@ if page == "💬 Chat":
                     question,
                     max_results=permissions.max_results,
                     top_n=permissions.top_n_rerank,
+                    policy=policy,
+                )
+
+            if not top_docs:
+                st.info(
+                    "No documents matching your clearance "
+                    f"(`{'`, `'.join(sorted(policy.clearance)) or 'none'}`) "
+                    "contain an answer to that question."
                 )
 
             sources = get_sources(top_docs)
@@ -350,3 +370,12 @@ elif page == "📊 Dashboard":
         st.markdown(f"- **Embeddings:** `{rag_cfg.embedding_model}`")
         st.markdown(f"- **Reranker:** `{rag_cfg.reranker_model}`")
         st.markdown(f"- **BM25 index:** {retriever.chunk_count} chunks")
+        st.markdown(f"- **Unlabelled chunks:** {retriever.unlabelled_count}")
+
+    st.subheader("Role Clearances")
+    st.table({
+        "Role": list(settings.roles),
+        "Can query": [p.can_query for p in settings.roles.values()],
+        "Clearance": [", ".join(sorted(p.clearance)) or "—" for p in settings.roles.values()],
+        "Depth": [p.top_n_rerank for p in settings.roles.values()],
+    })
