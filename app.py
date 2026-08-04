@@ -2,46 +2,56 @@
 app.py — Enterprise RAG Assistant
 Streamlit frontend for the RAG system.
 
-Changes from original:
-  - Config and users loaded from YAML files, not hardcoded
-  - API key loaded from .env if present — users don't re-type it every session
-  - CrossEncoder reranker is now actually wired into the pipeline
-  - max_results and top_n_rerank respected end-to-end per role
-  - Streaming responses (token by token, no blank wait screen)
-  - Feedback buttons use unique IDs — no key collisions, no double-voting
-  - Dashboard is hard-gated (st.stop) not just a warning
-  - Source list reflects only the chunks passed to the LLM
+This file is the only Streamlit-aware layer. Everything under rag/ is plain
+Python, so the same retrieval and generation code runs from the CLI
+(scripts/query.py), from tests, and from any future API server.
+
+Caching lives here because caching is a UI concern: @st.cache_resource wraps
+the framework-free factories rather than being baked into them.
 """
 
 import os
 import uuid
-import yaml
+
 import streamlit as st
 from dotenv import load_dotenv
 
-from rag.auth import authenticate, get_permissions
-from rag.retrieval import load_resources, hybrid_search, rerank
-from rag.generation import stream_answer, get_sources
-from rag.logger import log_query, save_feedback, load_logs, load_feedback
+from rag.auth import User, authenticate, authorize_query
+from rag.generation import get_sources, stream_answer
+from rag.logger import QueryLog
+from rag.retrieval import Retriever, build_retriever
+from rag.settings import Settings, get_settings
 
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────
-# Config
+# Cached resource loaders — the Streamlit boundary
 # ─────────────────────────────────────────────────────────────────
 
-@st.cache_data
-def load_config() -> dict:
-    with open("config/config.yaml", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
-config = load_config()
-app_cfg = config["app"]
-rag_cfg = config["rag"]
+@st.cache_resource
+def load_settings_cached() -> Settings:
+    return get_settings()
+
+
+@st.cache_resource(show_spinner="Loading models and index…")
+def load_retriever(api_key: str) -> Retriever:
+    return build_retriever(load_settings_cached(), api_key)
+
+
+@st.cache_resource
+def load_query_log() -> QueryLog:
+    return QueryLog()
+
+
+settings = load_settings_cached()
+app_cfg = settings.app
+rag_cfg = settings.rag
+query_log = load_query_log()
 
 st.set_page_config(
-    page_title=app_cfg["title"],
-    page_icon=app_cfg["icon"],
+    page_title=app_cfg.title,
+    page_icon=app_cfg.icon,
     layout="wide",
 )
 
@@ -71,8 +81,8 @@ if _env_key and not st.session_state.api_key:
 # ─────────────────────────────────────────────────────────────────
 
 if not st.session_state.logged_in:
-    st.title(f"{app_cfg['icon']} {app_cfg['title']}")
-    st.markdown(f"*{app_cfg['description']}*")
+    st.title(f"{app_cfg.icon} {app_cfg.title}")
+    st.markdown(f"*{app_cfg.description}*")
     st.divider()
 
     col_form, col_info = st.columns([1, 1], gap="large")
@@ -129,15 +139,20 @@ if not st.session_state.logged_in:
 # MAIN APP — user is logged in
 # ─────────────────────────────────────────────────────────────────
 
-user = st.session_state.get("user")
+user: User = st.session_state.get("user")
 if not user:
     st.rerun()
 
-permissions = get_permissions(user["role"], config)
+permissions = settings.permissions_for(user.role)
+
+# config.yaml has always defined can_query per role — now it is enforced.
+if not authorize_query(user, settings):
+    st.error(f"⛔ The `{user.role}` role is not permitted to query this system.")
+    st.stop()
 
 # Load all ML resources (cached after first load)
 try:
-    client, vectorstore, chunks, bm25, reranker = load_resources(st.session_state.api_key)
+    retriever = load_retriever(st.session_state.api_key)
 except Exception as e:
     st.error(
         f"⚠️ Failed to load resources: {e}\n\n"
@@ -146,7 +161,7 @@ except Exception as e:
     )
     st.stop()
 
-if len(chunks) == 0:
+if retriever.chunk_count == 0:
     st.warning(
         "No documents are indexed yet. Run the ingestion script first:\n"
         "```\npython scripts/ingest.py --pdf data/your_document.pdf\n```"
@@ -155,11 +170,11 @@ if len(chunks) == 0:
 
 # ── Sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
-    st.title(f"{app_cfg['icon']} {app_cfg['title']}")
+    st.title(f"{app_cfg.icon} {app_cfg.title}")
     st.divider()
-    st.markdown(f"**{user['display_name']}**")
-    st.caption(f"Role: `{user['role']}`")
-    st.caption(f"Retrieval depth: {permissions['top_n_rerank']} chunks")
+    st.markdown(f"**{user.display_name}**")
+    st.caption(f"Role: `{user.role}`")
+    st.caption(f"Retrieval depth: {permissions.top_n_rerank} chunks")
     st.divider()
 
     page = st.radio("Navigate", ["💬 Chat", "📊 Dashboard"], label_visibility="collapsed")
@@ -171,8 +186,8 @@ with st.sidebar:
         st.rerun()
 
     st.caption(
-        f"📦 {len(chunks)} chunks indexed · "
-        f"Model: `{rag_cfg['llm_model']}`"
+        f"📦 {retriever.chunk_count} chunks indexed · "
+        f"Model: `{rag_cfg.llm_model}`"
     )
 
 
@@ -190,7 +205,7 @@ if page == "💬 Chat":
 
         with st.chat_message("assistant"):
             st.write(entry["answer"])
-            if permissions["can_see_sources"] and entry["sources"]:
+            if permissions.can_see_sources and entry["sources"]:
                 st.caption(f"📄 Sources: {', '.join(entry['sources'])}")
 
             # Feedback — use stored ID to prevent key collisions and double-votes
@@ -201,17 +216,23 @@ if page == "💬 Chat":
                 cols = st.columns([1, 1, 10])
                 with cols[0]:
                     if st.button("👍", key=f"up_{_mid}"):
-                        save_feedback(user, entry["question"], entry["answer"], "useful")
+                        query_log.save_feedback(
+                            user.username, user.role,
+                            entry["question"], entry["answer"], "useful",
+                        )
                         st.session_state.voted.add(_mid)
                         st.rerun()
                 with cols[1]:
                     if st.button("👎", key=f"dn_{_mid}"):
-                        save_feedback(user, entry["question"], entry["answer"], "not_useful")
+                        query_log.save_feedback(
+                            user.username, user.role,
+                            entry["question"], entry["answer"], "not_useful",
+                        )
                         st.session_state.voted.add(_mid)
                         st.rerun()
 
     # Chat input
-    question = st.chat_input(f"Ask anything about your documents…")
+    question = st.chat_input("Ask anything about your documents…")
 
     if question:
         with st.chat_message("user"):
@@ -220,15 +241,10 @@ if page == "💬 Chat":
         with st.chat_message("assistant"):
             # Retrieval phase — show spinner while searching
             with st.spinner("🔍 Searching documents…"):
-                raw_docs = hybrid_search(
-                    client, vectorstore, chunks, bm25,
+                top_docs = retriever.retrieve(
                     question,
-                    llm_model=rag_cfg["llm_model"],
-                    k=permissions["max_results"],
-                )
-                top_docs = rerank(
-                    reranker, question, raw_docs,
-                    top_n=permissions["top_n_rerank"],
+                    max_results=permissions.max_results,
+                    top_n=permissions.top_n_rerank,
                 )
 
             sources = get_sources(top_docs)
@@ -236,35 +252,27 @@ if page == "💬 Chat":
             # Stream the answer token by token
             answer = st.write_stream(
                 stream_answer(
-                    client, question, top_docs,
-                    llm_model=rag_cfg["llm_model"],
-                    persona=app_cfg["persona"],
+                    retriever.client, question, top_docs,
+                    llm_model=rag_cfg.llm_model,
+                    persona=app_cfg.persona,
                 )
             )
 
-            if permissions["can_see_sources"] and sources:
+            if permissions.can_see_sources and sources:
                 st.caption(f"📄 Sources: {', '.join(sources)}")
 
-            # Feedback buttons for the new message
             new_id = str(uuid.uuid4())[:8]
-            cols = st.columns([1, 1, 10])
-            with cols[0]:
-                if st.button("👍", key=f"up_{new_id}"):
-                    save_feedback(user, question, answer, "useful")
-                    st.session_state.voted.add(new_id)
-            with cols[1]:
-                if st.button("👎", key=f"dn_{new_id}"):
-                    save_feedback(user, question, answer, "not_useful")
-                    st.session_state.voted.add(new_id)
 
         # Persist to history and log
-        log_query(user, question, answer, sources)
+        query_log.log_query(user.username, user.role, question, answer, sources)
         st.session_state.chat_history.append({
             "id": new_id,
             "question": question,
             "answer": answer,
             "sources": sources,
         })
+        # Re-render so the new turn picks up its feedback buttons from history.
+        st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -272,14 +280,14 @@ if page == "💬 Chat":
 # ─────────────────────────────────────────────────────────────────
 
 elif page == "📊 Dashboard":
-    if user["role"] != "admin":
+    if user.role != "admin":
         st.error("⛔ Access denied. The dashboard is only available to admin users.")
         st.stop()
 
     st.title("📊 Evaluation Dashboard")
 
-    queries = load_logs()
-    feedbacks = load_feedback()
+    queries = query_log.load_queries()
+    feedbacks = query_log.load_feedback()
 
     # ── Top metrics ──────────────────────────────────────────────
     useful = sum(1 for f in feedbacks if f["feedback"] == "useful")
@@ -303,7 +311,6 @@ elif page == "📊 Dashboard":
             role_counts: dict[str, int] = {}
             for q in queries:
                 role_counts[q["role"]] = role_counts.get(q["role"], 0) + 1
-            # st.bar_chart expects a dict or dataframe
             st.bar_chart(role_counts)
         else:
             st.caption("No queries logged yet.")
@@ -336,10 +343,10 @@ elif page == "📊 Dashboard":
     st.subheader("System Health")
     h1, h2 = st.columns(2)
     with h1:
-        st.markdown(f"- **Indexed chunks:** {len(chunks)}")
-        st.markdown(f"- **Vector DB:** ChromaDB · `{rag_cfg['collection_name']}`")
-        st.markdown(f"- **LLM:** `{rag_cfg['llm_model']}`")
+        st.markdown(f"- **Indexed chunks:** {retriever.chunk_count}")
+        st.markdown(f"- **Vector DB:** ChromaDB · `{rag_cfg.collection_name}`")
+        st.markdown(f"- **LLM:** `{rag_cfg.llm_model}`")
     with h2:
-        st.markdown(f"- **Embeddings:** `{rag_cfg['embedding_model']}`")
-        st.markdown(f"- **Reranker:** `{rag_cfg['reranker_model']}`")
-        st.markdown(f"- **BM25 index:** {len(chunks)} chunks")
+        st.markdown(f"- **Embeddings:** `{rag_cfg.embedding_model}`")
+        st.markdown(f"- **Reranker:** `{rag_cfg.reranker_model}`")
+        st.markdown(f"- **BM25 index:** {retriever.chunk_count} chunks")

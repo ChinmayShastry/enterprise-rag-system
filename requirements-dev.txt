@@ -1,0 +1,5 @@
+# Test-only dependencies.
+# The rag/ package is framework-free, so its unit tests need neither
+# Streamlit nor torch — install these on top of requirements.txt.
+-r requirements.txt
+pytest>=8.0.0

@@ -20,11 +20,12 @@ import os
 import sys
 from pathlib import Path
 
-# Allow running from project root
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Allow running from anywhere
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import yaml
 from dotenv import load_dotenv
+
+from rag.settings import ConfigError, Settings, load_settings
 
 load_dotenv()
 
@@ -34,13 +35,8 @@ def parse_args():
     parser.add_argument("--pdf", required=True, help="Path to the PDF file")
     parser.add_argument("--ocr", action="store_true", help="Force OCR extraction")
     parser.add_argument("--reset", action="store_true", help="Wipe existing collection first")
-    parser.add_argument("--config", default="config/config.yaml", help="Path to config.yaml")
+    parser.add_argument("--config", default=None, help="Path to config.yaml")
     return parser.parse_args()
-
-
-def load_config(config_path: str) -> dict:
-    with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 def extract_text_pypdf(pdf_path: str) -> list:
@@ -103,35 +99,32 @@ def chunk_documents(pages: list, chunk_size: int, chunk_overlap: int) -> list:
     return chunks
 
 
-def embed_and_store(chunks: list, cfg: dict, api_key: str, reset: bool) -> None:
-    from langchain_openai import OpenAIEmbeddings
+def embed_and_store(chunks: list, settings: Settings, api_key: str, reset: bool) -> None:
     from langchain_community.vectorstores import Chroma
+    from langchain_openai import OpenAIEmbeddings
 
-    rag_cfg = cfg["rag"]
-    chroma_path = os.getenv("CHROMA_PATH", rag_cfg.get("chroma_path", "./chroma_db"))
+    rag_cfg = settings.rag
+    chroma_path = str(rag_cfg.chroma_path)
 
-    embedding_model = OpenAIEmbeddings(
-        model=rag_cfg["embedding_model"],
-        openai_api_key=api_key,
-    )
+    embedding_model = OpenAIEmbeddings(model=rag_cfg.embedding_model, api_key=api_key)
 
     if reset:
         print("🗑️   Wiping existing collection…")
         import chromadb
         client = chromadb.PersistentClient(path=chroma_path)
         try:
-            client.delete_collection(rag_cfg["collection_name"])
+            client.delete_collection(rag_cfg.collection_name)
             print("   ✅  Collection wiped.")
         except Exception:
             print("   ℹ️   No existing collection to wipe.")
 
-    print(f"🔄  Generating embeddings with {rag_cfg['embedding_model']}…")
+    print(f"🔄  Generating embeddings with {rag_cfg.embedding_model}…")
     print(f"   (This calls the OpenAI API for {len(chunks)} chunks)")
 
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embedding_model,
-        collection_name=rag_cfg["collection_name"],
+        collection_name=rag_cfg.collection_name,
         persist_directory=chroma_path,
     )
 
@@ -149,8 +142,12 @@ def main():
         sys.exit(1)
 
     # Load config
-    cfg = load_config(args.config)
-    rag_cfg = cfg["rag"]
+    try:
+        settings = load_settings(args.config)
+    except ConfigError as e:
+        print(f"❌  {e}")
+        sys.exit(1)
+    rag_cfg = settings.rag
 
     # Resolve API key
     api_key = os.getenv("OPENAI_API_KEY")
@@ -161,8 +158,9 @@ def main():
         sys.exit(1)
 
     print(f"\n📄  Ingesting: {pdf_path.name}")
-    print(f"    Collection : {rag_cfg['collection_name']}")
-    print(f"    Chunk size : {rag_cfg['chunk_size']} chars (overlap {rag_cfg['chunk_overlap']})\n")
+    print(f"    Collection : {rag_cfg.collection_name}")
+    print(f"    Chunk size : {rag_cfg.chunk_size} chars (overlap {rag_cfg.chunk_overlap})")
+    print(f"    Vector store: {rag_cfg.chroma_path}\n")
 
     # Step 1: Extract text
     if args.ocr:
@@ -177,10 +175,10 @@ def main():
             print(f"✅  Extracted text from {len(pages)} pages via PyPDF.")
 
     # Step 2: Chunk
-    chunks = chunk_documents(pages, rag_cfg["chunk_size"], rag_cfg["chunk_overlap"])
+    chunks = chunk_documents(pages, rag_cfg.chunk_size, rag_cfg.chunk_overlap)
 
     # Step 3: Embed + store
-    embed_and_store(chunks, cfg, api_key, reset=args.reset)
+    embed_and_store(chunks, settings, api_key, reset=args.reset)
 
     print("\n✅  Ingestion complete. Run `streamlit run app.py` to start the assistant.\n")
 

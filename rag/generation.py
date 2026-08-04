@@ -65,3 +65,17 @@ def stream_answer(
         token = chunk.choices[0].delta.content
         if token:
             yield token
+
+
+def generate_answer(
+    client: OpenAI,
+    question: str,
+    docs: list[Document],
+    llm_model: str,
+    persona: str,
+) -> str:
+    """
+    Blocking variant of stream_answer() for callers with no UI to stream into
+    — the CLI, batch evaluation, or a future API endpoint.
+    """
+    return "".join(stream_answer(client, question, docs, llm_model, persona))

@@ -233,27 +233,69 @@ After retrieval, 20+ chunks may be returned. A cross-encoder model reads the que
 
 ```
 enterprise-rag-system/
-├── app.py                    # Streamlit frontend
-├── rag/
+├── app.py                    # Streamlit frontend — the ONLY Streamlit-aware file
+├── rag/                      # Framework-free package: no UI imports anywhere
 │   ├── __init__.py
-│   ├── auth.py               # Authentication and RBAC
-│   ├── retrieval.py          # Hybrid search and reranking
-│   ├── generation.py         # Streaming answer generation
-│   └── logger.py             # Query and feedback logging
+│   ├── settings.py           # Typed config + path resolution
+│   ├── auth.py               # Authentication and role lookup
+│   ├── retrieval.py          # Retriever: hybrid search and reranking
+│   ├── generation.py         # Streaming and blocking answer generation
+│   └── logger.py             # QueryLog — query and feedback logging
 ├── scripts/
-│   └── ingest.py             # PDF ingestion pipeline (run once per document)
+│   ├── ingest.py             # PDF ingestion pipeline (run once per document)
+│   └── query.py              # Headless CLI — answers a question, no browser
+├── tests/                    # pytest suite; needs neither Streamlit nor torch
 ├── config/
 │   ├── config.yaml           # App config, RAG settings, role permissions
 │   └── users.yaml            # User credentials and roles
-├── notebooks/
-│   └── RAG_development.ipynb # Development notebook (Phases 1-4)
-├── logs/                     # gitignored — created at runtime
+├── logs/                     # gitignored — created on first write
 ├── data/                     # gitignored — put your PDF here
-├── chroma_db/                # Vector store — committed for demo deployment
+├── chroma_db/                # gitignored — rebuilt by ingest.py
 ├── .env.example              # Copy to .env, add your API key
-├── .gitignore
+├── pytest.ini
 ├── requirements.txt
+├── requirements-dev.txt      # Adds pytest
 └── packages.txt              # System deps for Streamlit Cloud
+```
+
+### Why `rag/` has no Streamlit imports
+
+`rag/` is a plain Python package. Streamlit's `@st.cache_resource` used to live
+inside `rag/retrieval.py`, which meant retrieval could only run inside a browser
+session — no API server, no batch job, no test. Caching now lives in `app.py`,
+where it belongs:
+
+```python
+# app.py — the UI owns the caching
+@st.cache_resource(show_spinner="Loading models and index…")
+def load_retriever(api_key: str) -> Retriever:
+    return build_retriever(load_settings_cached(), api_key)
+```
+
+Paths resolve against the package rather than the process working directory, so
+the same code behaves identically under `streamlit run`, `pytest`, Docker, and
+cron. A test asserts Streamlit never reappears in `rag/`.
+
+---
+
+## Running Without the UI
+
+```bash
+# Answer a question from the terminal
+python scripts/query.py "How do I fix error code E4?"
+
+# Apply a specific role's retrieval depth and permissions
+python scripts/query.py "What is the notice period?" --role support
+
+# Machine-readable output, for piping into an evaluation harness
+python scripts/query.py "Max load?" --json
+```
+
+## Running the Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ---
@@ -267,6 +309,7 @@ enterprise-rag-system/
 | Phase 3 | RBAC login system, role-controlled retrieval depth, query logging to JSONL |
 | Phase 4 | Cross-encoder reranking, streaming answers, feedback system, evaluation dashboard |
 | Phase 5 | Modular refactor (rag/ package), config-driven design, standalone ingest.py script |
+| Phase 6 | Decoupled `rag/` from Streamlit — typed settings, CWD-independent paths, injectable dependencies, headless CLI, pytest suite |
 
 ---
 
@@ -276,7 +319,7 @@ enterprise-rag-system/
 - [ ] Safety warning pinning — chunks with WARNING or CAUTION always surface first
 - [ ] Document versioning — tag manuals by product model and version, prevent cross-version bleed
 - [ ] RAGAS evaluation — automated faithfulness, answer relevance, and context precision scoring
-- [ ] FastAPI backend — decouple retrieval from Streamlit for API access by other systems
+- [ ] FastAPI backend — expose the now framework-free `Retriever` over HTTP
 - [ ] Docker deployment — single command local or cloud setup
 - [ ] JWT authentication — replace the YAML credential system
 
