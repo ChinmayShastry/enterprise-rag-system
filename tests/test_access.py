@@ -34,40 +34,40 @@ def doc(text: str, classification: str | None = "public") -> Document:
 
 
 def test_policy_permits_cleared_classification(settings):
-    policy = AccessPolicy.for_role("support", settings)
+    policy = AccessPolicy.for_role("support", "acme", settings)
     assert policy.permits(doc("x", "public"))
     assert policy.permits(doc("x", "internal"))
 
 
 def test_policy_denies_uncleared_classification(settings):
-    policy = AccessPolicy.for_role("support", settings)
+    policy = AccessPolicy.for_role("support", "acme", settings)
     assert not policy.permits(doc("x", "confidential"))
 
 
 def test_policy_denies_unlabelled_chunks(settings):
     """Deny-by-default: no label means nobody, not everybody."""
-    admin = AccessPolicy.for_role("admin", settings)
+    admin = AccessPolicy.for_role("admin", "acme", settings)
     assert not admin.permits(doc("x", classification=None))
 
 
 def test_policy_denies_unrecognised_label(settings):
-    admin = AccessPolicy.for_role("admin", settings)
+    admin = AccessPolicy.for_role("admin", "acme", settings)
     assert not admin.permits(doc("x", "top-secret-typo"))
 
 
 def test_policy_denies_non_string_label(settings):
-    admin = AccessPolicy.for_role("admin", settings)
+    admin = AccessPolicy.for_role("admin", "acme", settings)
     assert not admin.permits(Document(page_content="x", metadata={"classification": 1}))
 
 
 def test_unknown_role_is_cleared_for_nothing(settings):
-    policy = AccessPolicy.for_role("no-such-role", settings)
+    policy = AccessPolicy.for_role("no-such-role", "acme", settings)
     assert policy.denies_everything
     assert policy.filter([doc("x", "public")]) == []
 
 
 def test_where_clause_lists_only_cleared_labels(settings):
-    policy = AccessPolicy.for_role("viewer", settings)
+    policy = AccessPolicy.for_role("viewer", "acme", settings)
     assert policy.where_clause() == {"classification": {"$in": ["public"]}}
 
 
@@ -77,11 +77,11 @@ def test_where_clause_is_none_when_cleared_for_nothing(settings):
     filter would mean "no filter" — i.e. return everything — so search() has
     to short-circuit before it gets there.
     """
-    assert AccessPolicy.for_role("suspended", settings).where_clause() is None
+    assert AccessPolicy.for_role("suspended", "acme", settings).where_clause() is None
 
 
 def test_filter_preserves_order(settings):
-    policy = AccessPolicy.for_role("support", settings)
+    policy = AccessPolicy.for_role("support", "acme", settings)
     docs = [doc("a", "public"), doc("b", "confidential"), doc("c", "internal")]
     assert [d.page_content for d in policy.filter(docs)] == ["a", "c"]
 
@@ -152,6 +152,7 @@ def build_mixed(settings, bm25_scores):
         bm25=FakeBM25(bm25_scores),
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
 
 
@@ -161,7 +162,7 @@ def retrieve_as(retriever, role, settings, question="severance terms"):
         question,
         max_results=perms.max_results,
         top_n=perms.top_n_rerank,
-        policy=AccessPolicy.for_role(role, settings),
+        policy=AccessPolicy.for_role(role, "acme", settings),
     )
 
 
@@ -191,7 +192,7 @@ def search_as(retriever, role, settings, question="severance terms"):
     return retriever.search(
         question,
         k=perms.max_results,
-        policy=AccessPolicy.for_role(role, settings),
+        policy=AccessPolicy.for_role(role, "acme", settings),
     )
 
 
@@ -223,9 +224,10 @@ def test_denied_chunks_do_not_crowd_out_permitted_ones(settings):
         bm25=FakeBM25([9.0, 8.0, 7.0, 6.0, 5.0, 1.0]),  # public chunk ranks last
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
     found = retriever.search(
-        "answer", k=2, policy=AccessPolicy.for_role("viewer", settings)
+        "answer", k=2, policy=AccessPolicy.for_role("viewer", "acme", settings)
     )
     assert [d.page_content for d in found] == ["public answer"]
 
@@ -287,6 +289,7 @@ def test_backstop_filters_a_leak_from_a_broken_search_path(settings):
         bm25=FakeBM25([0.0, 0.0]),
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
     results = retrieve_as(leaky, "viewer", settings)
     assert not any("severance" in d.page_content for d in results)
@@ -301,6 +304,7 @@ def test_unlabelled_chunks_are_invisible_to_every_role(settings):
         bm25=FakeBM25([9.9]),
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
     assert retriever.unlabelled_count == 1
     for role in ("admin", "support", "viewer"):

@@ -25,6 +25,7 @@ from rag.settings import Settings, resolve_path, users_path
 class User:
     username: str
     role: str
+    tenant: str
     display_name: str
 
 
@@ -49,6 +50,7 @@ def authenticate(
         return User(
             username=username,
             role=record.get("role", ""),
+            tenant=record.get("tenant", ""),
             display_name=record.get("display_name", username),
         )
     return None
@@ -62,6 +64,16 @@ def authorize_query(user: User, settings: Settings) -> bool:
     that actually enforces it.
     """
     return settings.permissions_for(user.role).can_query
+
+
+def authorize_tenant(user: User, settings: Settings) -> bool:
+    """
+    Whether this user belongs to a configured tenant.
+
+    A user with a missing or misspelt tenant must be refused rather than
+    defaulted anywhere — there is no safe corpus to fall back to.
+    """
+    return bool(user.tenant) and settings.has_tenant(user.tenant)
 
 
 def default_users_path() -> Path:

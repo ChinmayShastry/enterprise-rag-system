@@ -92,7 +92,9 @@ def make_docs(*texts: str, classification: str = "public") -> list[Document]:
     ]
 
 
-def build(settings, *, docs=None, bm25_scores=None, rewrite=REWRITES) -> Retriever:
+def build(
+    settings, *, docs=None, bm25_scores=None, rewrite=REWRITES, tenant_id="acme"
+) -> Retriever:
     docs = docs if docs is not None else make_docs("alpha text", "beta text")
     return Retriever(
         client=FakeClient(rewrite),
@@ -101,12 +103,13 @@ def build(settings, *, docs=None, bm25_scores=None, rewrite=REWRITES) -> Retriev
         bm25=FakeBM25(bm25_scores if bm25_scores is not None else [0.0] * len(docs)),
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant(tenant_id),
     )
 
 
 @pytest.fixture
 def admin(settings):
-    return AccessPolicy.for_role("admin", settings)
+    return AccessPolicy.for_role("admin", "acme", settings)
 
 
 # ── query rewriting ──────────────────────────────────────────────
@@ -165,6 +168,7 @@ def test_bm25_hits_are_merged_in(settings, admin):
         bm25=FakeBM25([0.0, 5.0]),              # BM25 scores only the second
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
     contents = {d.page_content for d in retriever.search("q", k=1, policy=admin)}
     assert contents == {"vector only", "keyword only"}
@@ -179,6 +183,7 @@ def test_zero_scoring_bm25_hits_are_ignored(settings, admin):
         bm25=FakeBM25([0.0, 0.0]),
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
     assert [d.page_content for d in retriever.search("q", k=1, policy=admin)] == [
         "vector only"
@@ -218,7 +223,7 @@ def test_retrieve_respects_role_depth(settings):
         "torque",
         max_results=perms.max_results,
         top_n=perms.top_n_rerank,
-        policy=AccessPolicy.for_role("viewer", settings),
+        policy=AccessPolicy.for_role("viewer", "acme", settings),
     )
     assert len(result) == perms.top_n_rerank == 2
 
@@ -234,7 +239,7 @@ def test_admin_gets_more_context_than_viewer(settings):
                 "torque",
                 max_results=perms.max_results,
                 top_n=perms.top_n_rerank,
-                policy=AccessPolicy.for_role(role, settings),
+                policy=AccessPolicy.for_role(role, "acme", settings),
             )
         )
 
@@ -254,6 +259,7 @@ def test_empty_index_yields_no_results(settings, admin):
         bm25=FakeBM25([]),
         reranker=FakeReranker(),
         settings=settings,
+        tenant=settings.tenant("acme"),
     )
     assert retriever.chunk_count == 0
     assert retriever.retrieve("q", max_results=5, top_n=3, policy=admin) == []

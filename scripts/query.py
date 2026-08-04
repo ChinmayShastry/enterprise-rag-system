@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 
 from rag.access import AccessPolicy
 from rag.generation import generate_answer, get_sources
-from rag.settings import ConfigError, load_settings
+from rag.settings import ConfigError, UnknownTenantError, load_settings
 
 load_dotenv()
 
@@ -41,6 +41,9 @@ for _stream in (sys.stdout, sys.stderr):
 def parse_args():
     parser = argparse.ArgumentParser(description="Query the RAG system from the CLI.")
     parser.add_argument("question", help="The question to ask")
+    parser.add_argument(
+        "--tenant", required=True, help="Tenant whose corpus to search"
+    )
     parser.add_argument(
         "--role",
         default="admin",
@@ -62,6 +65,12 @@ def main() -> int:
         print(f"❌  {e}", file=sys.stderr)
         return 1
 
+    try:
+        tenant = settings.tenant(args.tenant)
+    except UnknownTenantError as e:
+        print(f"❌  {e}", file=sys.stderr)
+        return 1
+
     permissions = settings.permissions_for(args.role)
     if not permissions.can_query:
         print(
@@ -80,12 +89,16 @@ def main() -> int:
     # Imported here so --help and the guard clauses above stay fast.
     from rag.retrieval import build_retriever
 
-    retriever = build_retriever(settings, api_key)
+    retriever = build_retriever(settings, api_key, tenant.tenant_id)
     if retriever.chunk_count == 0:
-        print("❌  No documents indexed. Run scripts/ingest.py first.", file=sys.stderr)
+        print(
+            f"❌  No documents indexed for tenant '{tenant.tenant_id}'. "
+            f"Run: scripts/ingest.py --tenant {tenant.tenant_id} --pdf ...",
+            file=sys.stderr,
+        )
         return 1
 
-    policy = AccessPolicy.from_permissions(args.role, permissions)
+    policy = AccessPolicy.from_permissions(args.role, tenant.tenant_id, permissions)
     docs = retriever.retrieve(
         args.question,
         max_results=permissions.max_results,

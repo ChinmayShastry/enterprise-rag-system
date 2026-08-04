@@ -33,22 +33,37 @@ CLASSIFICATION_KEY = "classification"
 @dataclass(frozen=True)
 class AccessPolicy:
     """
-    What one role is allowed to retrieve.
+    Who is asking, and what they are allowed to retrieve.
+
+    Carries the tenant as well as the clearance so a retriever can refuse a
+    policy belonging to a different tenant — see Retriever.retrieve().
 
     Build it with `for_role()` rather than constructing it directly, so the
     clearance always comes from config rather than a call site.
     """
 
     role: str
+    tenant: str
     clearance: frozenset[str]
 
     @classmethod
-    def for_role(cls, role: str, settings: Settings) -> "AccessPolicy":
-        return cls(role=role, clearance=settings.permissions_for(role).clearance)
+    def for_role(cls, role: str, tenant: str, settings: Settings) -> "AccessPolicy":
+        return cls(
+            role=role,
+            tenant=tenant,
+            clearance=settings.permissions_for(role).clearance,
+        )
 
     @classmethod
-    def from_permissions(cls, role: str, permissions: RolePermissions) -> "AccessPolicy":
-        return cls(role=role, clearance=permissions.clearance)
+    def from_permissions(
+        cls, role: str, tenant: str, permissions: RolePermissions
+    ) -> "AccessPolicy":
+        return cls(role=role, tenant=tenant, clearance=permissions.clearance)
+
+    @classmethod
+    def for_user(cls, user, settings: Settings) -> "AccessPolicy":
+        """Policy for an authenticated user, taking both role and tenant from them."""
+        return cls.for_role(user.role, user.tenant, settings)
 
     @property
     def denies_everything(self) -> bool:

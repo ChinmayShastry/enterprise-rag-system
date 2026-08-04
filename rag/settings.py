@@ -14,6 +14,7 @@ Docker, and cron.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -79,7 +80,7 @@ DEFAULT_CLASSIFICATIONS: tuple[str, ...] = ("public", "internal", "confidential"
 
 @dataclass(frozen=True)
 class RagConfig:
-    collection_name: str
+    collection_prefix: str
     chroma_path: Path
     chunk_size: int
     chunk_overlap: int
@@ -87,6 +88,15 @@ class RagConfig:
     llm_model: str
     reranker_model: str
     default_classification: str
+
+
+@dataclass(frozen=True)
+class TenantConfig:
+    """One customer's isolated corpus."""
+
+    tenant_id: str
+    display_name: str
+    collection_name: str
 
 
 @dataclass(frozen=True)
@@ -116,12 +126,31 @@ class Settings:
     app: AppConfig
     rag: RagConfig
     roles: dict[str, RolePermissions]
+    tenants: dict[str, TenantConfig]
     classifications: tuple[str, ...]
     source_path: Path
 
     def permissions_for(self, role: str) -> RolePermissions:
         """Permissions for a role, falling back to RESTRICTED if undefined."""
         return self.roles.get(role, RESTRICTED)
+
+    def tenant(self, tenant_id: str) -> TenantConfig:
+        """
+        Look up a tenant, raising rather than inventing a default.
+
+        There is no sensible fallback here: guessing a tenant would point a
+        query at somebody else's corpus.
+        """
+        try:
+            return self.tenants[tenant_id]
+        except KeyError:
+            raise UnknownTenantError(
+                f"Unknown tenant '{tenant_id}'. Configured tenants: "
+                f"{', '.join(sorted(self.tenants)) or 'none'}"
+            ) from None
+
+    def has_tenant(self, tenant_id: str) -> bool:
+        return tenant_id in self.tenants
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -131,6 +160,20 @@ class Settings:
 
 class ConfigError(RuntimeError):
     """Raised when config.yaml is missing or structurally invalid."""
+
+
+class UnknownTenantError(LookupError):
+    """
+    Raised when code asks for a tenant that is not configured.
+
+    Deliberately not a KeyError: KeyError.__str__ returns repr(arg), which
+    would print the message wrapped in quotes in CLI error output.
+    """
+
+
+# ChromaDB collection names: 3-63 chars, alphanumeric at both ends, and only
+# alphanumerics, underscores, hyphens and dots in between.
+_COLLECTION_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{1,61}[a-zA-Z0-9]$")
 
 
 def _require(section: dict, key: str, where: str):
@@ -179,8 +222,19 @@ def load_settings(path: str | os.PathLike | None = None) -> Settings:
             f"the declared classifications {list(classifications)}"
         )
 
+    # Refuse to guess during the single-tenant migration: silently reusing the
+    # old collection_name as a prefix would repoint every query at a different
+    # (empty) collection without saying so.
+    if "collection_name" in rag_raw and "collection_prefix" not in rag_raw:
+        raise ConfigError(
+            "rag.collection_name is no longer used. Rename it to "
+            "rag.collection_prefix and add a `tenants:` section — each tenant's "
+            "collection becomes '<collection_prefix>_<tenant_id>'. Existing data "
+            "must be re-ingested with `scripts/ingest.py --tenant <id> --reset`."
+        )
+
     rag = RagConfig(
-        collection_name=_require(rag_raw, "collection_name", "rag"),
+        collection_prefix=_require(rag_raw, "collection_prefix", "rag"),
         chroma_path=resolve_path(chroma_raw),
         chunk_size=int(rag_raw.get("chunk_size", 500)),
         chunk_overlap=int(rag_raw.get("chunk_overlap", 100)),
@@ -203,13 +257,65 @@ def load_settings(path: str | os.PathLike | None = None) -> Settings:
 
     _validate_clearances(roles, classifications)
 
+    tenants = _load_tenants(raw.get("tenants") or {}, rag.collection_prefix)
+
     return Settings(
         app=app,
         rag=rag,
         roles=roles,
+        tenants=tenants,
         classifications=classifications,
         source_path=resolved,
     )
+
+
+def _load_tenants(
+    tenants_raw: dict,
+    collection_prefix: str,
+) -> dict[str, TenantConfig]:
+    """
+    Build the tenant table and prove the tenants are actually isolated.
+
+    Two tenants pointing at one collection would look like working config while
+    silently merging two customers' corpora, so that is a hard error rather
+    than a warning.
+    """
+    if not tenants_raw:
+        raise ConfigError(
+            "No tenants configured. Add a `tenants:` section to config.yaml "
+            "with at least one entry."
+        )
+
+    tenants: dict[str, TenantConfig] = {}
+    collections: dict[str, str] = {}  # collection name -> owning tenant
+
+    for tenant_id, spec in tenants_raw.items():
+        spec = spec or {}
+        collection = spec.get("collection") or f"{collection_prefix}_{tenant_id}"
+
+        if not _COLLECTION_RE.match(collection):
+            raise ConfigError(
+                f"Tenant '{tenant_id}' resolves to collection '{collection}', which "
+                "is not a valid ChromaDB collection name (3-63 characters, "
+                "alphanumeric at both ends, and only letters, digits, '_', '-' "
+                "and '.' in between)."
+            )
+
+        if collection in collections:
+            raise ConfigError(
+                f"Tenants '{collections[collection]}' and '{tenant_id}' both map to "
+                f"collection '{collection}'. Tenants must not share a collection — "
+                "that would merge their documents."
+            )
+
+        collections[collection] = tenant_id
+        tenants[tenant_id] = TenantConfig(
+            tenant_id=tenant_id,
+            display_name=spec.get("display_name", tenant_id),
+            collection_name=collection,
+        )
+
+    return tenants
 
 
 def _validate_clearances(

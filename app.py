@@ -17,7 +17,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from rag.access import AccessPolicy
-from rag.auth import User, authenticate, authorize_query
+from rag.auth import User, authenticate, authorize_query, authorize_tenant
 from rag.generation import get_sources, stream_answer
 from rag.logger import QueryLog
 from rag.retrieval import Retriever, build_retriever
@@ -36,19 +36,24 @@ def load_settings_cached() -> Settings:
 
 
 @st.cache_resource(show_spinner="Loading models and index…")
-def load_retriever(api_key: str) -> Retriever:
-    return build_retriever(load_settings_cached(), api_key)
+def load_retriever(api_key: str, tenant_id: str) -> Retriever:
+    """
+    Cached per (api_key, tenant). The tenant MUST be part of the cache key —
+    keying on the API key alone would hand one tenant's retriever, and so one
+    tenant's documents, to any other tenant sharing that key.
+    """
+    return build_retriever(load_settings_cached(), api_key, tenant_id)
 
 
 @st.cache_resource
-def load_query_log() -> QueryLog:
-    return QueryLog()
+def load_query_log(tenant_id: str) -> QueryLog:
+    """One audit trail per tenant, so an admin dashboard shows only its own."""
+    return QueryLog.for_tenant(tenant_id)
 
 
 settings = load_settings_cached()
 app_cfg = settings.app
 rag_cfg = settings.rag
-query_log = load_query_log()
 
 st.set_page_config(
     page_title=app_cfg.title,
@@ -122,15 +127,17 @@ if not st.session_state.logged_in:
     with col_info:
         st.subheader("Demo Accounts")
         st.markdown("""
-| Username | Password | Role    | Sources | Depth |
-|----------|----------|---------|---------|-------|
-| alice    | alice123 | Admin   | ✅ Visible | 5 chunks |
-| bob      | bob123   | Support | ✅ Visible | 3 chunks |
-| guest    | guest123 | Viewer  | ❌ Hidden  | 2 chunks |
+| Username | Password | Tenant | Role    | Clearance |
+|----------|----------|--------|---------|-----------|
+| alice    | alice123 | acme   | Admin   | public, internal, confidential |
+| bob      | bob123   | acme   | Support | public, internal |
+| guest    | guest123 | acme   | Viewer  | public |
+| carol    | carol123 | globex | Admin   | public, internal, confidential |
         """)
         st.caption(
-            "Different roles retrieve different amounts of context and control "
-            "what metadata is exposed in the UI."
+            "Clearance decides which documents a role can retrieve. Tenant decides "
+            "which corpus exists at all — Carol is an admin, but cannot reach a "
+            "single Acme document."
         )
 
     st.stop()
@@ -145,16 +152,28 @@ if not user:
     st.rerun()
 
 permissions = settings.permissions_for(user.role)
-policy = AccessPolicy.from_permissions(user.role, permissions)
+
+# A user whose tenant is missing or misspelt has no safe corpus to fall back
+# on, so refuse rather than defaulting to one.
+if not authorize_tenant(user, settings):
+    st.error(
+        f"⛔ Account `{user.username}` is assigned to tenant `{user.tenant or '(none)'}`, "
+        "which is not configured. Contact your administrator."
+    )
+    st.stop()
+
+tenant = settings.tenant(user.tenant)
+policy = AccessPolicy.for_user(user, settings)
+query_log = load_query_log(tenant.tenant_id)
 
 # config.yaml has always defined can_query per role — now it is enforced.
 if not authorize_query(user, settings):
     st.error(f"⛔ The `{user.role}` role is not permitted to query this system.")
     st.stop()
 
-# Load all ML resources (cached after first load)
+# Load all ML resources (cached per api key AND tenant)
 try:
-    retriever = load_retriever(st.session_state.api_key)
+    retriever = load_retriever(st.session_state.api_key, tenant.tenant_id)
 except Exception as e:
     st.error(
         f"⚠️ Failed to load resources: {e}\n\n"
@@ -165,8 +184,10 @@ except Exception as e:
 
 if retriever.chunk_count == 0:
     st.warning(
-        "No documents are indexed yet. Run the ingestion script first:\n"
-        "```\npython scripts/ingest.py --pdf data/your_document.pdf\n```"
+        f"No documents are indexed for **{tenant.display_name}** yet. "
+        "Run the ingestion script first:\n"
+        f"```\npython scripts/ingest.py --tenant {tenant.tenant_id} "
+        "--pdf data/your_document.pdf\n```"
     )
     st.stop()
 
@@ -184,6 +205,7 @@ with st.sidebar:
     st.title(f"{app_cfg.icon} {app_cfg.title}")
     st.divider()
     st.markdown(f"**{user.display_name}**")
+    st.caption(f"Tenant: `{tenant.tenant_id}` — {tenant.display_name}")
     st.caption(f"Role: `{user.role}`")
     st.caption(f"Clearance: {', '.join(f'`{c}`' for c in sorted(policy.clearance))}")
     st.caption(f"Retrieval depth: {permissions.top_n_rerank} chunks")
@@ -231,6 +253,7 @@ if page == "💬 Chat":
                         query_log.save_feedback(
                             user.username, user.role,
                             entry["question"], entry["answer"], "useful",
+                            tenant=tenant.tenant_id,
                         )
                         st.session_state.voted.add(_mid)
                         st.rerun()
@@ -239,6 +262,7 @@ if page == "💬 Chat":
                         query_log.save_feedback(
                             user.username, user.role,
                             entry["question"], entry["answer"], "not_useful",
+                            tenant=tenant.tenant_id,
                         )
                         st.session_state.voted.add(_mid)
                         st.rerun()
@@ -284,7 +308,10 @@ if page == "💬 Chat":
             new_id = str(uuid.uuid4())[:8]
 
         # Persist to history and log
-        query_log.log_query(user.username, user.role, question, answer, sources)
+        query_log.log_query(
+            user.username, user.role, question, answer, sources,
+            tenant=tenant.tenant_id,
+        )
         st.session_state.chat_history.append({
             "id": new_id,
             "question": question,
@@ -359,12 +386,32 @@ elif page == "📊 Dashboard":
 
     st.divider()
 
+    # ── Indexed documents ─────────────────────────────────────────
+    st.subheader("Indexed Documents")
+    docs = retriever.documents()
+    if docs:
+        st.table({
+            "Document ID": [d.doc_id for d in docs],
+            "Title": [d.title for d in docs],
+            "Classification": [d.classification for d in docs],
+            "Chunks": [d.chunk_count for d in docs],
+        })
+        st.caption(
+            f"Remove one with: `python scripts/documents.py delete "
+            f"--tenant {tenant.tenant_id} --doc-id <id>`"
+        )
+    else:
+        st.caption("No documents carry a doc_id — re-ingest to populate this view.")
+
+    st.divider()
+
     # ── System health ─────────────────────────────────────────────
     st.subheader("System Health")
     h1, h2 = st.columns(2)
     with h1:
+        st.markdown(f"- **Tenant:** `{tenant.tenant_id}` — {tenant.display_name}")
         st.markdown(f"- **Indexed chunks:** {retriever.chunk_count}")
-        st.markdown(f"- **Vector DB:** ChromaDB · `{rag_cfg.collection_name}`")
+        st.markdown(f"- **Vector DB:** ChromaDB · `{tenant.collection_name}`")
         st.markdown(f"- **LLM:** `{rag_cfg.llm_model}`")
     with h2:
         st.markdown(f"- **Embeddings:** `{rag_cfg.embedding_model}`")

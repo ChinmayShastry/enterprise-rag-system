@@ -22,7 +22,17 @@ from typing import TYPE_CHECKING, Any
 from langchain_core.documents import Document
 
 from rag.access import AccessPolicy, unlabelled
-from rag.settings import Settings
+from rag.settings import Settings, TenantConfig
+
+
+class TenantMismatchError(RuntimeError):
+    """
+    Raised when a retriever is handed a policy belonging to another tenant.
+
+    This should be unreachable, and that is the point: the most likely way it
+    fires is a cached retriever being reused across tenants, which would
+    otherwise be a silent cross-tenant read.
+    """
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from openai import OpenAI
@@ -53,6 +63,7 @@ class Retriever:
         bm25: "BM25Okapi",
         reranker: "CrossEncoder",
         settings: Settings,
+        tenant: TenantConfig,
     ):
         self.client = client
         self.vectorstore = vectorstore
@@ -60,10 +71,17 @@ class Retriever:
         self.bm25 = bm25
         self.reranker = reranker
         self.settings = settings
+        self.tenant = tenant
 
     @property
     def chunk_count(self) -> int:
         return len(self.chunks)
+
+    def documents(self) -> list:
+        """Inventory of the documents in this tenant's collection."""
+        from rag.documents import list_documents
+
+        return list_documents(self.vectorstore)
 
     @property
     def unlabelled_count(self) -> int:
@@ -73,6 +91,22 @@ class Retriever:
         labelling and needs re-ingesting.
         """
         return len(unlabelled(self.chunks))
+
+    def _assert_same_tenant(self, policy: AccessPolicy) -> None:
+        """
+        Refuse to serve a policy from another tenant.
+
+        Collection-per-tenant already makes cross-tenant retrieval impossible
+        in practice — this retriever only ever holds one tenant's collection.
+        The check exists because the realistic failure is not a bad filter but
+        a wrongly cached retriever, and an exception is far better than
+        quietly answering one customer from another's documents.
+        """
+        if policy.tenant != self.tenant.tenant_id:
+            raise TenantMismatchError(
+                f"Retriever is bound to tenant '{self.tenant.tenant_id}' but was "
+                f"given a policy for tenant '{policy.tenant}'."
+            )
 
     # ── query rewriting ──────────────────────────────────────────
 
@@ -113,6 +147,8 @@ class Retriever:
         right default, and a keyword argument makes every call site declare
         whose access it is running under.
         """
+        self._assert_same_tenant(policy)
+
         if policy.denies_everything:
             return []
 
@@ -184,6 +220,10 @@ class Retriever:
         the backstop that keeps a future bug in either path from putting an
         unauthorised chunk in front of the LLM.
         """
+        # Checked here as well as in search(), so a subclass or future rewrite
+        # of search() cannot skip the tenant check.
+        self._assert_same_tenant(policy)
+
         candidates = self.search(question, k=max_results, policy=policy)
         ranked = self.rerank(question, candidates, top_n=top_n)
         return policy.filter(ranked)
@@ -194,12 +234,17 @@ class Retriever:
 # ─────────────────────────────────────────────────────────────────
 
 
-def build_retriever(settings: Settings, api_key: str) -> Retriever:
+def build_retriever(settings: Settings, api_key: str, tenant_id: str) -> Retriever:
     """
-    Load the vector store, rebuild the BM25 index, and load the cross-encoder.
+    Load one tenant's vector store, rebuild its BM25 index, and load the
+    cross-encoder.
+
+    The retriever is bound to a single tenant's collection, so a caller holding
+    it can only ever read that tenant's documents. Callers that cache this MUST
+    include tenant_id in the cache key.
 
     This is expensive — the caller decides how to cache it. app.py uses
-    @st.cache_resource; a long-lived server would build it once at startup.
+    @st.cache_resource; a long-lived server would build one per tenant.
     """
     from langchain_community.vectorstores import Chroma
     from langchain_openai import OpenAIEmbeddings
@@ -208,12 +253,13 @@ def build_retriever(settings: Settings, api_key: str) -> Retriever:
     from sentence_transformers import CrossEncoder
 
     rag_cfg = settings.rag
+    tenant = settings.tenant(tenant_id)  # raises UnknownTenantError
 
     client = OpenAI(api_key=api_key)
 
     embeddings = OpenAIEmbeddings(model=rag_cfg.embedding_model, api_key=api_key)
     vectorstore = Chroma(
-        collection_name=rag_cfg.collection_name,
+        collection_name=tenant.collection_name,
         embedding_function=embeddings,
         persist_directory=str(rag_cfg.chroma_path),
     )
@@ -236,4 +282,5 @@ def build_retriever(settings: Settings, api_key: str) -> Retriever:
         bm25=bm25,
         reranker=reranker,
         settings=settings,
+        tenant=tenant,
     )

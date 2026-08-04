@@ -13,7 +13,7 @@ SAMPLE_CONFIG = {
         "description": "Testing.",
     },
     "rag": {
-        "collection_name": "test_docs",
+        "collection_prefix": "test_docs",
         "chroma_path": "./chroma_test",
         "chunk_size": 400,
         "chunk_overlap": 80,
@@ -23,6 +23,10 @@ SAMPLE_CONFIG = {
         "default_classification": "internal",
     },
     "security": {"classifications": ["public", "internal", "confidential"]},
+    "tenants": {
+        "acme": {"display_name": "Acme Manufacturing"},
+        "globex": {"display_name": "Globex Corporation"},
+    },
     "roles": {
         "admin": {
             "can_query": True,
@@ -51,9 +55,27 @@ SAMPLE_CONFIG = {
 
 SAMPLE_USERS = {
     "users": {
-        "alice": {"password": "alice123", "role": "admin", "display_name": "Alice"},
-        "guest": {"password": "guest123", "role": "viewer", "display_name": "Guest"},
-        "mallory": {"password": "hunter2", "role": "suspended", "display_name": "Mal"},
+        "alice": {
+            "password": "alice123", "role": "admin",
+            "tenant": "acme", "display_name": "Alice",
+        },
+        "guest": {
+            "password": "guest123", "role": "viewer",
+            "tenant": "acme", "display_name": "Guest",
+        },
+        "mallory": {
+            "password": "hunter2", "role": "suspended",
+            "tenant": "acme", "display_name": "Mal",
+        },
+        "carol": {
+            "password": "carol123", "role": "admin",
+            "tenant": "globex", "display_name": "Carol",
+        },
+        # Deliberately points at a tenant that does not exist in config.
+        "orphan": {
+            "password": "orphan123", "role": "admin",
+            "tenant": "nowhere", "display_name": "Orphan",
+        },
     }
 }
 
@@ -84,3 +106,14 @@ def settings(config_file):
     from rag.settings import load_settings
 
     return load_settings(config_file)
+
+
+@pytest.fixture
+def acme(settings):
+    """The default tenant for tests that are not about multi-tenancy."""
+    return settings.tenant("acme")
+
+
+@pytest.fixture
+def globex(settings):
+    return settings.tenant("globex")

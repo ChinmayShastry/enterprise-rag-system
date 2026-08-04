@@ -29,7 +29,16 @@ class QueryLog:
 
     Pass `directory` to isolate a test run, a tenant, or a deployment;
     omit it to use the LOG_DIR env var or the project's logs/ folder.
+    Use for_tenant() to keep each customer's audit trail in its own file, so
+    one tenant's admin dashboard cannot read another's queries.
     """
+
+    @classmethod
+    def for_tenant(
+        cls, tenant_id: str, directory: str | os.PathLike | None = None
+    ) -> "QueryLog":
+        base = resolve_path(directory) if directory is not None else log_dir()
+        return cls(base / tenant_id)
 
     def __init__(self, directory: str | os.PathLike | None = None):
         self.directory = resolve_path(directory) if directory is not None else log_dir()
@@ -51,11 +60,13 @@ class QueryLog:
         question: str,
         answer: str,
         sources: list[str],
+        tenant: str = "",
     ) -> None:
         self._append(
             self.query_file,
             {
                 "timestamp": _now(),
+                "tenant": tenant,
                 "username": username,
                 "role": role,
                 "question": question,
@@ -71,12 +82,14 @@ class QueryLog:
         question: str,
         answer: str,
         feedback: str,
+        tenant: str = "",
     ) -> None:
         """`feedback` is "useful" or "not_useful"."""
         self._append(
             self.feedback_file,
             {
                 "timestamp": _now(),
+                "tenant": tenant,
                 "username": username,
                 "role": role,
                 "question": question,

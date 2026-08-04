@@ -122,14 +122,65 @@ pip install -r requirements.txt
 cp .env.example .env
 # Open .env and add: OPENAI_API_KEY=sk-your-key-here
 
-# 3. Ingest your document
-python scripts/ingest.py --pdf data/your_manual.pdf
+# 3. Ingest your document into a tenant
+python scripts/ingest.py --tenant acme --pdf data/your_manual.pdf
 
 # 4. Run
 streamlit run app.py
 ```
 
 Open `http://localhost:8501`. Log in with any demo account and start asking questions.
+
+---
+
+## Multi-Tenancy
+
+One deployment, many customers. Every user belongs to exactly one tenant, and
+every document lands in exactly one tenant's collection.
+
+```yaml
+tenants:
+  acme:
+    display_name: "Acme Manufacturing"
+  globex:
+    display_name: "Globex Corporation"
+```
+
+**Isolation is structural, not filter-based.** Each tenant gets its own
+ChromaDB collection (`<collection_prefix>_<tenant_id>`), and a retriever is
+built against exactly one of them. Another tenant's vectors are not present to
+leak — there is no filter to get wrong. The config loader refuses to start if
+two tenants resolve to the same collection.
+
+Clearance composes on top: it decides what you see *within* your tenant.
+In the demo, Carol is a Globex admin with full clearance and still cannot
+retrieve a single Acme document.
+
+The one realistic way to subvert this is a retriever cached across tenants, so
+`Retriever` raises `TenantMismatchError` if handed a policy from another tenant,
+and `app.py` includes the tenant in its `@st.cache_resource` key. Audit logs are
+written per tenant, so one customer's admin dashboard cannot read another's
+queries.
+
+---
+
+## Managing Documents
+
+Documents have stable identities, so re-ingesting one **replaces** it:
+
+```bash
+# List what a tenant has indexed
+python scripts/documents.py list --tenant acme
+
+# Remove a single document (no more --reset to drop just one)
+python scripts/documents.py delete --tenant acme --doc-id old-manual
+```
+
+Chunk IDs are derived from `(tenant, doc_id, position, content)`. Previously
+ingestion used `Chroma.from_documents()`, which mints a fresh UUID per chunk —
+running it twice on the same PDF silently left two full copies in the index and
+every answer was drawn from a duplicated corpus. Re-ingesting now removes the
+old version first, so a shorter v2 cannot leave v1's tail behind.
 
 ---
 
@@ -168,7 +219,7 @@ rag:
 Switch documents by updating the config and re-ingesting:
 
 ```bash
-python scripts/ingest.py --pdf data/new_document.pdf --reset
+python scripts/ingest.py --tenant acme --pdf data/new_document.pdf --reset
 ```
 
 ---
@@ -177,16 +228,19 @@ python scripts/ingest.py --pdf data/new_document.pdf --reset
 
 ```bash
 # Standard — auto-detects text vs scanned
-python scripts/ingest.py --pdf data/manual.pdf
+python scripts/ingest.py --tenant acme --pdf data/manual.pdf
 
 # Force OCR for scanned or image-heavy PDFs
-python scripts/ingest.py --pdf data/scanned_manual.pdf --ocr
+python scripts/ingest.py --tenant acme --pdf data/scanned_manual.pdf --ocr
 
-# Replace existing collection with a new version
-python scripts/ingest.py --pdf data/manual_v2.pdf --reset
+# Update a document in place — replaces it, does not duplicate it
+python scripts/ingest.py --tenant acme --pdf data/manual_v2.pdf --doc-id manual
+
+# Wipe the whole tenant collection and start over
+python scripts/ingest.py --tenant acme --pdf data/manual.pdf --reset
 
 # Label the document so only cleared roles can retrieve it
-python scripts/ingest.py --pdf data/handbook.pdf --classification confidential
+python scripts/ingest.py --tenant acme --pdf data/handbook.pdf --classification confidential
 ```
 
 Every chunk is labelled. Without `--classification` the document takes
@@ -201,7 +255,9 @@ The script automatically falls back to OCR if text extraction returns mostly emp
 
 ## Roles and Access Control
 
-Defined in `config/users.yaml` and `config/config.yaml`.
+Defined in `config/users.yaml` and `config/config.yaml`. Access is decided by
+two independent boundaries: **tenant** (which corpus exists at all) and
+**clearance** (which documents inside it you may retrieve).
 
 | Role | Chat | Dashboard | Clearance | Retrieval depth | See page citations |
 |---|---|---|---|---|---|
@@ -270,13 +326,15 @@ enterprise-rag-system/
 │   ├── __init__.py
 │   ├── settings.py           # Typed config + path resolution
 │   ├── access.py             # AccessPolicy — which documents a role may retrieve
+│   ├── documents.py          # Document identity, stable chunk IDs, list/delete
 │   ├── auth.py               # Authentication and role lookup
 │   ├── retrieval.py          # Retriever: hybrid search and reranking
 │   ├── generation.py         # Streaming and blocking answer generation
 │   └── logger.py             # QueryLog — query and feedback logging
 ├── scripts/
-│   ├── ingest.py             # PDF ingestion pipeline (run once per document)
-│   └── query.py              # Headless CLI — answers a question, no browser
+│   ├── ingest.py             # PDF ingestion pipeline (per tenant, per document)
+│   ├── query.py              # Headless CLI — answers a question, no browser
+│   └── documents.py          # List and delete indexed documents
 ├── tests/                    # pytest suite; needs neither Streamlit nor torch
 ├── config/
 │   ├── config.yaml           # App config, RAG settings, role permissions
@@ -315,13 +373,13 @@ cron. A test asserts Streamlit never reappears in `rag/`.
 
 ```bash
 # Answer a question from the terminal
-python scripts/query.py "How do I fix error code E4?"
+python scripts/query.py --tenant acme "How do I fix error code E4?"
 
 # Apply a specific role's retrieval depth and permissions
-python scripts/query.py "What is the notice period?" --role support
+python scripts/query.py --tenant acme "What is the notice period?" --role support
 
 # Machine-readable output, for piping into an evaluation harness
-python scripts/query.py "Max load?" --json
+python scripts/query.py --tenant acme "Max load?" --json
 ```
 
 ## Running the Tests
@@ -344,14 +402,16 @@ pytest
 | Phase 5 | Modular refactor (rag/ package), config-driven design, standalone ingest.py script |
 | Phase 6 | Decoupled `rag/` from Streamlit — typed settings, CWD-independent paths, injectable dependencies, headless CLI, pytest suite |
 | Phase 7 | Document-level RBAC — classification labels at ingest, per-role clearance enforced inside both search paths, deny-by-default, config validated at startup |
+| Phase 8 | Multi-tenancy — collection-per-tenant isolation, tenant-bound retrievers, per-tenant audit logs, stable content-hash chunk IDs, per-document lifecycle |
 
 ---
 
 ## Roadmap
 
-- [ ] Multi-document support — query across your entire product catalog, filter by product
+- [x] Multi-document support — stable doc IDs, replace-not-duplicate ingestion, per-document delete
 - [ ] Safety warning pinning — chunks with WARNING or CAUTION always surface first
 - [ ] Document versioning — tag manuals by product model and version, prevent cross-version bleed
+- [ ] Cross-document filtering — restrict a query to a subset of a tenant's documents
 - [ ] RAGAS evaluation — automated faithfulness, answer relevance, and context precision scoring
 - [ ] FastAPI backend — expose the now framework-free `Retriever` over HTTP
 - [ ] Docker deployment — single command local or cloud setup

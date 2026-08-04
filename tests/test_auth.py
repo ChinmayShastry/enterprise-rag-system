@@ -45,4 +45,4 @@ def test_authorize_query_blocks_role_with_can_query_false(users_file, settings):
 def test_authorize_query_blocks_role_missing_from_config(users_file, settings):
     from rag.auth import User
 
-    assert authorize_query(User("x", "ghost-role", "X"), settings) is False
+    assert authorize_query(User("x", "ghost-role", "acme", "X"), settings) is False

@@ -12,8 +12,11 @@ app:
   description: "Ask questions about your documents using natural language."
 
 rag:
-  # Name of the ChromaDB collection. Change when switching documents.
-  collection_name: "documents"
+  # Each tenant gets its own ChromaDB collection, named
+  # "<collection_prefix>_<tenant_id>" unless the tenant overrides it below.
+  # Isolation is structural: a tenant's query runs against a collection that
+  # physically does not contain another tenant's vectors.
+  collection_prefix: "documents"
   # Path to the persisted ChromaDB store (can be overridden by CHROMA_PATH env var)
   chroma_path: "./chroma_db"
 
@@ -30,6 +33,23 @@ rag:
   # Deliberately not the most permissive value: an unthinking ingestion
   # should not publish a document to everyone.
   default_classification: "internal"
+
+# ─────────────────────────────────────────────────────────────────
+# Tenants
+#
+# One deployment, many customers. Every user belongs to exactly one
+# tenant, and every ingested document lands in exactly one tenant's
+# collection. Two tenants may never share a collection — the config
+# loader rejects that outright.
+#
+# `collection` is optional; omit it to use "<collection_prefix>_<id>".
+# ─────────────────────────────────────────────────────────────────
+tenants:
+  acme:
+    display_name: "Acme Manufacturing"
+
+  globex:
+    display_name: "Globex Corporation"
 
 # ─────────────────────────────────────────────────────────────────
 # Document classification
