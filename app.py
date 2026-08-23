@@ -23,7 +23,7 @@ from rag.generation import get_sources, stream_answer
 from rag.ingestion import IngestionError, ingest_upload, roles_cleared_for
 from rag.logger import QueryLog
 from rag.retrieval import Retriever, build_retriever
-from rag.settings import Settings, get_settings
+from rag.settings import Settings, config_path, load_settings
 
 load_dotenv()
 
@@ -32,9 +32,31 @@ load_dotenv()
 # ─────────────────────────────────────────────────────────────────
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
+def _settings_at(_config_mtime: float) -> Settings:
+    """Parse config.yaml. Keyed on mtime by load_settings_cached() below."""
+    return load_settings()
+
+
 def load_settings_cached() -> Settings:
-    return get_settings()
+    """
+    Read config.yaml, re-parsing it whenever the file changes.
+
+    config.yaml and users.yaml used to have different lifetimes: settings were
+    cached for the life of the process, while credentials were re-read on every
+    login. Editing both — renaming a tenant, say — left a running app matching
+    new users against old tenants, which surfaced as the baffling "account X is
+    assigned to tenant Y, which is not configured" until someone restarted the
+    process.
+
+    Keying the cache on the file's modification time keeps the two consistent
+    without re-parsing YAML on every widget interaction.
+    """
+    try:
+        mtime = config_path().stat().st_mtime
+    except OSError:
+        mtime = 0.0  # load_settings() will raise a useful ConfigError below
+    return _settings_at(mtime)
 
 
 @st.cache_resource(show_spinner="Loading models and index…")
@@ -180,8 +202,15 @@ permissions = settings.permissions_for(user.role)
 # on, so refuse rather than defaulting to one.
 if not authorize_tenant(user, settings):
     st.error(
-        f"⛔ Account `{user.username}` is assigned to tenant `{user.tenant or '(none)'}`, "
-        "which is not configured. Contact your administrator."
+        f"⛔ Account `{user.username}` is assigned to organization "
+        f"`{user.tenant or '(none)'}`, which is not configured."
+    )
+    st.caption(
+        "Configured organizations: "
+        + (", ".join(f"`{t}`" for t in sorted(settings.tenants)) or "none")
+        + f" — read from `{settings.source_path.name}`. If you just renamed one, "
+        "the running app may still be holding the previous configuration; "
+        "restart it (on Streamlit Community Cloud: **Manage app → Reboot**)."
     )
     st.stop()
 

@@ -109,3 +109,46 @@ def test_env_overrides_for_paths(monkeypatch, tmp_path):
 
 def test_resolve_path_leaves_absolute_paths_alone(tmp_path):
     assert resolve_path(tmp_path) == tmp_path
+
+
+def test_editing_config_is_visible_to_a_fresh_load(config_file):
+    """
+    Regression: config.yaml was cached for the life of the process while
+    users.yaml was re-read on every login. Renaming a tenant in both left a
+    running app matching new users against old tenants, reported as "account X
+    is assigned to tenant Y, which is not configured".
+
+    load_settings() must therefore always reflect the file on disk; app.py
+    caches it keyed on the file's mtime rather than forever.
+    """
+    import yaml
+
+    assert "demo-tenant" not in load_settings(config_file).tenants
+
+    raw = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+    raw["tenants"]["demo-tenant"] = {"display_name": "Added Later"}
+    config_file.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    assert "demo-tenant" in load_settings(config_file).tenants
+
+
+def test_app_keys_its_settings_cache_on_the_config_file(tmp_path):
+    """
+    app.py cannot be imported under test, so this reads the source: the
+    settings cache must be keyed on something that changes when config.yaml
+    changes, not cached unconditionally for the process lifetime.
+    """
+    import ast
+
+    tree = ast.parse((PROJECT_ROOT / "app.py").read_text(encoding="utf-8"))
+    loader = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "load_settings_cached"
+    )
+    body = ast.dump(loader)
+    assert "st_mtime" in body, (
+        "load_settings_cached must key its cache on the config file's "
+        "modification time, or edits to config.yaml will not be picked up "
+        "while users.yaml is re-read on every login"
+    )
