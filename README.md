@@ -382,6 +382,45 @@ python scripts/query.py --tenant acme "What is the notice period?" --role suppor
 python scripts/query.py --tenant acme "Max load?" --json
 ```
 
+## Deploying to Streamlit Community Cloud
+
+1. Push the branch to GitHub.
+2. At [share.streamlit.io](https://share.streamlit.io) → **Create app** → pick this
+   repo, the branch, and `app.py` as the main file.
+3. Under **Advanced settings → Secrets**, add your key:
+
+   ```toml
+   OPENAI_API_KEY = "sk-..."
+   ```
+
+   Streamlit Cloud exposes secrets through `st.secrets`, not the process
+   environment, which is why `app.py` checks both.
+4. Deploy. First build takes a few minutes — `packages.txt` installs Tesseract
+   and Poppler for OCR, and `requirements.txt` pulls the CPU PyTorch wheel.
+5. Sign in as `alice`, open **📁 Documents**, and upload a PDF.
+
+### The storage caveat
+
+**Streamlit Cloud's filesystem is ephemeral.** `chroma_db/` lives on local disk,
+so anything you ingest is lost when the app sleeps, restarts, or redeploys. For
+a demo that is usually fine — sign in as an admin and re-upload. For anything
+you expect to persist, move the vector store off local disk: point
+`CHROMA_PATH` at a mounted volume on a host that has one, or switch to a hosted
+vector database.
+
+Committing `chroma_db/` to the repo works but is a poor trade: it bloats the
+repository, goes stale the moment a document changes, and puts your customers'
+document text in Git history.
+
+### Resource notes
+
+The cross-encoder is the heaviest part of this app. If the free tier cannot
+load it, the app still starts, answers from hybrid-search ordering, and shows a
+warning in the sidebar. To cut the footprint deliberately, drop
+`sentence-transformers` from `requirements.txt` — everything else keeps working.
+
+---
+
 ## Running the Tests
 
 ```bash

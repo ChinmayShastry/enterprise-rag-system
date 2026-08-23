@@ -17,6 +17,7 @@ stand-in collaborators.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.documents import Document
@@ -38,6 +39,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from openai import OpenAI
     from rank_bm25 import BM25Okapi
     from sentence_transformers import CrossEncoder
+
+logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -61,7 +64,7 @@ class Retriever:
         vectorstore: Any,
         chunks: list[Document],
         bm25: "BM25Okapi | None",
-        reranker: "CrossEncoder",
+        reranker: "CrossEncoder | None",
         settings: Settings,
         tenant: TenantConfig,
     ):
@@ -193,6 +196,15 @@ class Retriever:
 
     # ── reranking ────────────────────────────────────────────────
 
+    @property
+    def reranking_enabled(self) -> bool:
+        """
+        False when the cross-encoder could not be loaded. Answers are still
+        produced, from the hybrid search order rather than a relevance score,
+        so the UI should say so rather than silently serving weaker context.
+        """
+        return self.reranker is not None
+
     def rerank(
         self,
         question: str,
@@ -203,9 +215,15 @@ class Retriever:
         Score every retrieved chunk against the question with a cross-encoder,
         which reads query and document together and is far more accurate than
         cosine similarity alone. Returns the top_n in ranked order.
+
+        Falls back to hybrid-search order when no cross-encoder is available —
+        see build_retriever(). Degraded relevance beats a dead application.
         """
         if not docs:
             return docs
+
+        if self.reranker is None:
+            return docs[:top_n]
 
         pairs = [[question, doc.page_content] for doc in docs]
         scores = self.reranker.predict(pairs)
@@ -244,6 +262,43 @@ class Retriever:
 # ─────────────────────────────────────────────────────────────────
 
 
+def _load_reranker(model_name: str):
+    """
+    Load the cross-encoder, or return None if it is unavailable.
+
+    sentence-transformers pulls in torch, which is by far the heaviest
+    dependency here and the one most likely to be missing or to exhaust memory
+    on a constrained host — a free-tier PaaS dyno, for instance. Reranking
+    improves relevance but is not required to answer a question, so the whole
+    application should not fail to start over it.
+
+    The caller can check Retriever.reranking_enabled and tell the user that
+    results are ordered by hybrid search alone.
+    """
+    try:
+        from sentence_transformers import CrossEncoder
+    except Exception as e:  # ImportError, or a torch that fails to initialise
+        logger.warning(
+            "Cross-encoder unavailable (%s: %s); falling back to hybrid-search "
+            "order. Install sentence-transformers to restore reranking.",
+            type(e).__name__,
+            e,
+        )
+        return None
+
+    try:
+        return CrossEncoder(model_name)
+    except Exception as e:  # download failure, corrupt cache, out of memory
+        logger.warning(
+            "Could not load reranker model %r (%s: %s); falling back to "
+            "hybrid-search order.",
+            model_name,
+            type(e).__name__,
+            e,
+        )
+        return None
+
+
 def build_retriever(settings: Settings, api_key: str, tenant_id: str) -> Retriever:
     """
     Load one tenant's vector store, rebuild its BM25 index, and load the
@@ -260,7 +315,6 @@ def build_retriever(settings: Settings, api_key: str, tenant_id: str) -> Retriev
     from langchain_openai import OpenAIEmbeddings
     from openai import OpenAI
     from rank_bm25 import BM25Okapi
-    from sentence_transformers import CrossEncoder
 
     rag_cfg = settings.rag
     tenant = settings.tenant(tenant_id)  # raises UnknownTenantError
@@ -290,7 +344,7 @@ def build_retriever(settings: Settings, api_key: str, tenant_id: str) -> Retriev
     # of chunks that are all whitespace.
     bm25 = BM25Okapi(tokenized) if any(tokenized) else None
 
-    reranker = CrossEncoder(rag_cfg.reranker_model)
+    reranker = _load_reranker(rag_cfg.reranker_model)
 
     return Retriever(
         client=client,

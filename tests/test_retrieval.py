@@ -211,6 +211,62 @@ def test_rerank_top_n_larger_than_input_is_safe(settings):
     assert len(retriever.rerank("one", docs, top_n=10)) == 1
 
 
+# ── degraded mode: no cross-encoder ──────────────────────────────
+#
+# sentence-transformers pulls in torch, the heaviest dependency here and the
+# one most likely to be absent or to exhaust memory on a constrained host.
+# Reranking improves relevance but is not required to answer a question, so
+# the app degrades rather than refusing to start.
+
+
+def build_without_reranker(settings, docs=None) -> Retriever:
+    docs = docs if docs is not None else make_docs("alpha", "beta", "gamma")
+    return Retriever(
+        client=FakeClient(REWRITES),
+        vectorstore=FakeVectorStore(docs),
+        chunks=docs,
+        bm25=FakeBM25([0.0] * len(docs)),
+        reranker=None,
+        settings=settings,
+        tenant=settings.tenant("acme"),
+    )
+
+
+def test_reranking_enabled_reports_true_when_present(settings):
+    assert build(settings).reranking_enabled is True
+
+
+def test_reranking_enabled_reports_false_when_absent(settings):
+    assert build_without_reranker(settings).reranking_enabled is False
+
+
+def test_rerank_without_a_cross_encoder_falls_back_to_search_order(settings):
+    retriever = build_without_reranker(settings)
+    docs = make_docs("first", "second", "third")
+    ranked = retriever.rerank("anything", docs, top_n=2)
+    assert [d.page_content for d in ranked] == ["first", "second"]
+
+
+def test_retrieve_still_works_without_a_cross_encoder(settings, admin):
+    retriever = build_without_reranker(settings)
+    results = retriever.retrieve("alpha", max_results=5, top_n=2, policy=admin)
+    assert len(results) == 2
+
+
+def test_clearance_still_enforced_without_a_cross_encoder(settings):
+    """Degrading relevance must not degrade access control."""
+    docs = make_docs("public thing") + [
+        Document(
+            page_content="confidential thing",
+            metadata={"page": 2, "classification": "confidential"},
+        )
+    ]
+    retriever = build_without_reranker(settings, docs=docs)
+    viewer = AccessPolicy.for_role("viewer", "acme", settings)
+    results = retriever.retrieve("thing", max_results=5, top_n=5, policy=viewer)
+    assert not any("confidential" in d.page_content for d in results)
+
+
 # ── full pipeline ────────────────────────────────────────────────
 
 

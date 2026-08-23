@@ -78,8 +78,26 @@ for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# Pre-fill API key from environment if available
-_env_key = os.getenv("OPENAI_API_KEY")
+def _configured_api_key() -> str | None:
+    """
+    The deployment's own key, if it has one.
+
+    Streamlit Community Cloud supplies secrets through st.secrets rather than
+    the process environment, so checking os.environ alone would prompt every
+    visitor of a deployed app for a key that the operator had already set.
+    Accessing st.secrets raises when no secrets file exists, which is the
+    normal case locally.
+    """
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
+
+
+# Pre-fill API key from the deployment's configuration if it has one
+_env_key = _configured_api_key()
 if _env_key and not st.session_state.api_key:
     st.session_state.api_key = _env_key
 
@@ -226,6 +244,12 @@ with st.sidebar:
         f"📦 {retriever.chunk_count} chunks indexed · "
         f"Model: `{rag_cfg.llm_model}`"
     )
+    if not retriever.reranking_enabled:
+        # Say so rather than silently serving weaker context.
+        st.caption(
+            "⚠️ Cross-encoder unavailable — results are ordered by hybrid "
+            "search alone."
+        )
 
 
 # An empty tenant blocks querying but not document management — an admin has to
