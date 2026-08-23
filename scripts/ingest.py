@@ -8,10 +8,10 @@ and prints progress, so the CLI and the admin upload page in app.py cannot
 drift apart.
 
 Usage:
-    python scripts/ingest.py --tenant acme --pdf data/manual.pdf
-    python scripts/ingest.py --tenant acme --pdf data/scanned.pdf --ocr
-    python scripts/ingest.py --tenant acme --pdf data/v2.pdf --doc-id manual
-    python scripts/ingest.py --tenant acme --pdf data/manual.pdf --reset
+    python scripts/ingest.py --tenant demo --pdf data/manual.pdf
+    python scripts/ingest.py --tenant demo --pdf data/scanned.pdf --ocr
+    python scripts/ingest.py --tenant demo --pdf data/v2.pdf --doc-id manual
+    python scripts/ingest.py --tenant demo --pdf data/manual.pdf --reset
 """
 
 import argparse

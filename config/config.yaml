@@ -7,7 +7,7 @@ app:
   title: "Enterprise RAG Assistant"
   icon: "🤖"
   # The persona shapes how the assistant introduces itself and answers.
-  # Tailor this to your domain, e.g. "a support assistant for Acme HR policies"
+  # Tailor this to your domain, e.g. "an HR assistant for company policies"
   persona: "a helpful assistant for company documentation"
   description: "Ask questions about your documents using natural language."
 
@@ -44,12 +44,17 @@ rag:
 #
 # `collection` is optional; omit it to use "<collection_prefix>_<id>".
 # ─────────────────────────────────────────────────────────────────
+#
+# The two below are demonstration tenants, named for what they show rather
+# than after invented companies. Replace them with your real organisations.
 tenants:
-  acme:
-    display_name: "Acme Manufacturing"
+  demo:
+    display_name: "Demo Organization"
 
-  globex:
-    display_name: "Globex Corporation"
+  # Exists purely to prove isolation: Carol is an admin here with full
+  # clearance, and still cannot retrieve a single Demo Organization document.
+  other-org:
+    display_name: "Other Organization"
 
 # ─────────────────────────────────────────────────────────────────
 # Document classification

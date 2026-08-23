@@ -147,17 +147,20 @@ if not st.session_state.logged_in:
     with col_info:
         st.subheader("Demo Accounts")
         st.markdown("""
-| Username | Password | Tenant | Role    | Clearance |
-|----------|----------|--------|---------|-----------|
-| alice    | alice123 | acme   | Admin   | public, internal, confidential |
-| bob      | bob123   | acme   | Support | public, internal |
-| guest    | guest123 | acme   | Viewer  | public |
-| carol    | carol123 | globex | Admin   | public, internal, confidential |
+| Username | Password | Organization | Role | Can retrieve |
+|----------|----------|--------------|------|--------------|
+| alice    | alice123 | Demo  | Admin   | public, internal, confidential |
+| bob      | bob123   | Demo  | Support | public, internal |
+| guest    | guest123 | Demo  | Viewer  | public only |
+| carol    | carol123 | Other | Admin   | nothing of Demo's corpus |
         """)
         st.caption(
-            "Clearance decides which documents a role can retrieve. Tenant decides "
-            "which corpus exists at all — Carol is an admin, but cannot reach a "
-            "single Acme document."
+            "**Two boundaries, deliberately different.** Sign in as Alice, Bob "
+            "and Guest to watch the same question return different source "
+            "documents — a role controls *which* documents it can reach, not "
+            "just how many. Then sign in as Carol: she is an admin with full "
+            "clearance in a different organization, and cannot retrieve a "
+            "single document from Demo's corpus."
         )
 
     st.stop()
@@ -256,15 +259,24 @@ with st.sidebar:
 # be able to reach the upload page in order to fix it.
 if retriever.chunk_count == 0 and page != "📁 Documents":
     if user.role == "admin":
-        st.warning(
-            f"No documents are indexed for **{tenant.display_name}** yet. "
-            "Open **📁 Documents** in the sidebar to upload one."
+        st.info(
+            f"**{tenant.display_name}** has no documents yet — "
+            "open **📁 Documents** in the sidebar to upload one."
         )
     else:
-        st.warning(
-            f"No documents are indexed for **{tenant.display_name}** yet. "
+        st.info(
+            f"**{tenant.display_name}** has no documents yet. "
             "An administrator needs to upload one before you can ask questions."
         )
+    # Explain the empty corpus rather than just reporting it: a first-time
+    # visitor has no reason to know why the app is scoped to an organization
+    # at all, and this is the clearest moment to say so.
+    st.caption(
+        f"Each organization has its own corpus. Anything uploaded to "
+        f"**{tenant.display_name}** is stored in a separate vector collection "
+        "that no other organization can search — and within it, each role "
+        "retrieves only the documents its clearance allows."
+    )
     st.stop()
 
 

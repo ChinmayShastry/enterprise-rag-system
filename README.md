@@ -123,7 +123,7 @@ cp .env.example .env
 # Open .env and add: OPENAI_API_KEY=sk-your-key-here
 
 # 3. Ingest your document into a tenant
-python scripts/ingest.py --tenant acme --pdf data/your_manual.pdf
+python scripts/ingest.py --tenant demo --pdf data/your_manual.pdf
 
 # 4. Run
 streamlit run app.py
@@ -140,11 +140,14 @@ every document lands in exactly one tenant's collection.
 
 ```yaml
 tenants:
-  acme:
-    display_name: "Acme Manufacturing"
-  globex:
-    display_name: "Globex Corporation"
+  demo:
+    display_name: "Demo Organization"
+  other-org:
+    display_name: "Other Organization"
 ```
+
+The shipped names describe what they demonstrate rather than inventing
+companies. Replace them with your own organisations.
 
 **Isolation is structural, not filter-based.** Each tenant gets its own
 ChromaDB collection (`<collection_prefix>_<tenant_id>`), and a retriever is
@@ -153,8 +156,8 @@ leak — there is no filter to get wrong. The config loader refuses to start if
 two tenants resolve to the same collection.
 
 Clearance composes on top: it decides what you see *within* your tenant.
-In the demo, Carol is a Globex admin with full clearance and still cannot
-retrieve a single Acme document.
+In the demo, Carol is an admin of Other Organization with full clearance
+and still cannot retrieve a single document belonging to Demo Organization.
 
 The one realistic way to subvert this is a retriever cached across tenants, so
 `Retriever` raises `TenantMismatchError` if handed a policy from another tenant,
@@ -170,10 +173,10 @@ Documents have stable identities, so re-ingesting one **replaces** it:
 
 ```bash
 # List what a tenant has indexed
-python scripts/documents.py list --tenant acme
+python scripts/documents.py list --tenant demo
 
 # Remove a single document (no more --reset to drop just one)
-python scripts/documents.py delete --tenant acme --doc-id old-manual
+python scripts/documents.py delete --tenant demo --doc-id old-manual
 ```
 
 Chunk IDs are derived from `(tenant, doc_id, position, content)`. Previously
@@ -188,38 +191,40 @@ old version first, so a shorter v2 cannot leave v1's tail behind.
 
 Everything lives in `config/config.yaml` — no code changes needed.
 
-**For a product manual:**
+**For product manuals:**
 ```yaml
 app:
-  title: "Bosch Dishwasher Support Assistant"
+  title: "Dishwasher Support Assistant"
   icon: "🍽️"
-  persona: "a support assistant for Bosch dishwasher product manuals"
+  persona: "a support assistant for dishwasher product manuals"
   description: "Ask anything about installation, troubleshooting, and maintenance."
 
 rag:
-  collection_name: "bosch_dishwasher_manual"
+  collection_prefix: "manuals"
   chunk_size: 500
   chunk_overlap: 100
 ```
 
-**For an HR policy document:**
+**For HR and compliance documents:**
 ```yaml
 app:
-  title: "Acme HR Policy Assistant"
+  title: "HR Policy Assistant"
   icon: "📋"
-  persona: "an HR assistant for Acme company policies and compliance documents"
+  persona: "an HR assistant for company policies and compliance documents"
   description: "Ask about leave policies, compliance procedures, and employee guidelines."
 
 rag:
-  collection_name: "acme_hr_policies"
+  collection_prefix: "policies"
   chunk_size: 600
   chunk_overlap: 150
+  # HR material should not become staff-wide readable by default
+  default_classification: "confidential"
 ```
 
 Switch documents by updating the config and re-ingesting:
 
 ```bash
-python scripts/ingest.py --tenant acme --pdf data/new_document.pdf --reset
+python scripts/ingest.py --tenant demo --pdf data/new_document.pdf --reset
 ```
 
 ---
@@ -228,19 +233,19 @@ python scripts/ingest.py --tenant acme --pdf data/new_document.pdf --reset
 
 ```bash
 # Standard — auto-detects text vs scanned
-python scripts/ingest.py --tenant acme --pdf data/manual.pdf
+python scripts/ingest.py --tenant demo --pdf data/manual.pdf
 
 # Force OCR for scanned or image-heavy PDFs
-python scripts/ingest.py --tenant acme --pdf data/scanned_manual.pdf --ocr
+python scripts/ingest.py --tenant demo --pdf data/scanned_manual.pdf --ocr
 
 # Update a document in place — replaces it, does not duplicate it
-python scripts/ingest.py --tenant acme --pdf data/manual_v2.pdf --doc-id manual
+python scripts/ingest.py --tenant demo --pdf data/manual_v2.pdf --doc-id manual
 
 # Wipe the whole tenant collection and start over
-python scripts/ingest.py --tenant acme --pdf data/manual.pdf --reset
+python scripts/ingest.py --tenant demo --pdf data/manual.pdf --reset
 
 # Label the document so only cleared roles can retrieve it
-python scripts/ingest.py --tenant acme --pdf data/handbook.pdf --classification confidential
+python scripts/ingest.py --tenant demo --pdf data/handbook.pdf --classification confidential
 ```
 
 Every chunk is labelled. Without `--classification` the document takes
@@ -373,13 +378,13 @@ cron. A test asserts Streamlit never reappears in `rag/`.
 
 ```bash
 # Answer a question from the terminal
-python scripts/query.py --tenant acme "How do I fix error code E4?"
+python scripts/query.py --tenant demo "How do I fix error code E4?"
 
 # Apply a specific role's retrieval depth and permissions
-python scripts/query.py --tenant acme "What is the notice period?" --role support
+python scripts/query.py --tenant demo "What is the notice period?" --role support
 
 # Machine-readable output, for piping into an evaluation harness
-python scripts/query.py --tenant acme "Max load?" --json
+python scripts/query.py --tenant demo "Max load?" --json
 ```
 
 ## Deploying to Streamlit Community Cloud

@@ -7,8 +7,8 @@ Until now the only lifecycle operation was `ingest.py --reset`, which wipes
 everything. This lists what is indexed and removes one document at a time.
 
 Usage:
-    python scripts/documents.py list --tenant acme
-    python scripts/documents.py delete --tenant acme --doc-id old-manual
+    python scripts/documents.py list --tenant demo
+    python scripts/documents.py delete --tenant demo --doc-id old-manual
 """
 
 from __future__ import annotations
