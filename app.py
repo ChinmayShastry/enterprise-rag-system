@@ -18,7 +18,9 @@ from dotenv import load_dotenv
 
 from rag.access import AccessPolicy
 from rag.auth import User, authenticate, authorize_query, authorize_tenant
+from rag.documents import delete_document
 from rag.generation import get_sources, stream_answer
+from rag.ingestion import IngestionError, ingest_upload, roles_cleared_for
 from rag.logger import QueryLog
 from rag.retrieval import Retriever, build_retriever
 from rag.settings import Settings, get_settings
@@ -182,23 +184,19 @@ except Exception as e:
     )
     st.stop()
 
-if retriever.chunk_count == 0:
-    st.warning(
-        f"No documents are indexed for **{tenant.display_name}** yet. "
-        "Run the ingestion script first:\n"
-        f"```\npython scripts/ingest.py --tenant {tenant.tenant_id} "
-        "--pdf data/your_document.pdf\n```"
-    )
-    st.stop()
-
 # Unlabelled chunks are retrievable by nobody, so say so loudly rather than
 # letting them look like a retrieval failure.
 if retriever.unlabelled_count:
     st.warning(
         f"⚠️ {retriever.unlabelled_count} of {retriever.chunk_count} indexed chunks "
         "have no classification label and are invisible to every role. "
-        "Re-ingest with `--reset` to label them."
+        "Re-upload them to apply a label."
     )
+
+# NOTE: the "no documents indexed" guard deliberately does NOT live here.
+# Stopping the script before the sidebar renders would lock an admin out of the
+# Documents page — the one place they can fix an empty tenant. The check is
+# applied per page, after navigation, further down.
 
 # ── Sidebar ──────────────────────────────────────────────────────
 with st.sidebar:
@@ -211,7 +209,12 @@ with st.sidebar:
     st.caption(f"Retrieval depth: {permissions.top_n_rerank} chunks")
     st.divider()
 
-    page = st.radio("Navigate", ["💬 Chat", "📊 Dashboard"], label_visibility="collapsed")
+    # Document management is an admin capability: uploading changes what every
+    # other user of the tenant can retrieve.
+    _pages = ["💬 Chat", "📊 Dashboard"]
+    if user.role == "admin":
+        _pages.insert(1, "📁 Documents")
+    page = st.radio("Navigate", _pages, label_visibility="collapsed")
     st.divider()
 
     if st.button("Sign Out", use_container_width=True):
@@ -225,11 +228,182 @@ with st.sidebar:
     )
 
 
+# An empty tenant blocks querying but not document management — an admin has to
+# be able to reach the upload page in order to fix it.
+if retriever.chunk_count == 0 and page != "📁 Documents":
+    if user.role == "admin":
+        st.warning(
+            f"No documents are indexed for **{tenant.display_name}** yet. "
+            "Open **📁 Documents** in the sidebar to upload one."
+        )
+    else:
+        st.warning(
+            f"No documents are indexed for **{tenant.display_name}** yet. "
+            "An administrator needs to upload one before you can ask questions."
+        )
+    st.stop()
+
+
+# ─────────────────────────────────────────────────────────────────
+# DOCUMENTS PAGE (admin only — hard gate)
+# ─────────────────────────────────────────────────────────────────
+
+if page == "📁 Documents":
+    if user.role != "admin":
+        st.error("⛔ Access denied. Document management is admin-only.")
+        st.stop()
+
+    st.title("📁 Documents")
+    st.caption(
+        f"Uploading here writes into **{tenant.display_name}**'s own collection "
+        f"(`{tenant.collection_name}`). No other tenant can retrieve it."
+    )
+
+    upload_tab, manage_tab = st.tabs(["⬆️ Upload", "🗂️ Manage"])
+
+    # ── Upload ───────────────────────────────────────────────────
+    with upload_tab:
+        uploaded = st.file_uploader(
+            "PDF to ingest",
+            type=["pdf"],
+            help="Scanned PDFs are detected automatically and run through OCR.",
+        )
+
+        col_left, col_right = st.columns(2)
+        with col_left:
+            classification = st.selectbox(
+                "Classification",
+                options=list(settings.classifications),
+                index=list(settings.classifications).index(
+                    rag_cfg.default_classification
+                ),
+                help="Decides which roles can retrieve this document.",
+            )
+        with col_right:
+            doc_title = st.text_input(
+                "Title (optional)",
+                placeholder=uploaded.name if uploaded else "Defaults to the filename",
+            )
+
+        # Show the access consequence before spending anything on embeddings,
+        # so "confidential" is not discovered later as an apparent bug.
+        cleared = roles_cleared_for(settings, classification)
+        if cleared:
+            st.info(
+                f"Retrievable by: **{', '.join(cleared)}**"
+                + (
+                    ""
+                    if len(cleared) == len(settings.roles)
+                    else f" — hidden from: {', '.join(sorted(set(settings.roles) - set(cleared)))}"
+                )
+            )
+        else:
+            st.warning(
+                f"No role is cleared for `{classification}`, so nobody would be "
+                "able to retrieve this document."
+            )
+
+        with st.expander("Advanced"):
+            force_ocr = st.checkbox(
+                "Force OCR",
+                help="Use for image-only PDFs that extract as blank pages.",
+            )
+            custom_doc_id = st.text_input(
+                "Document ID (optional)",
+                placeholder="Defaults to a slug of the filename",
+                help="Re-uploading with the same ID replaces that document "
+                     "rather than duplicating it.",
+            )
+
+        if st.button(
+            "Ingest document",
+            type="primary",
+            disabled=uploaded is None,
+            use_container_width=True,
+        ):
+            status = st.status("Ingesting…", expanded=True)
+            try:
+                result = ingest_upload(
+                    uploaded.getvalue(),
+                    uploaded.name,
+                    settings=settings,
+                    tenant_id=tenant.tenant_id,
+                    api_key=st.session_state.api_key,
+                    doc_id=custom_doc_id or None,
+                    title=doc_title or None,
+                    classification=classification,
+                    force_ocr=force_ocr,
+                    on_progress=lambda message: status.write(message),
+                )
+            except IngestionError as e:
+                status.update(label="Ingestion failed", state="error")
+                st.error(f"⚠️ {e}")
+            except Exception as e:  # noqa: BLE001 - surface anything to the operator
+                status.update(label="Ingestion failed", state="error")
+                st.error(f"⚠️ Unexpected error: {e}")
+            else:
+                status.update(label="Ingestion complete", state="complete")
+                st.success(
+                    f"Stored **{result.title}** as `{result.doc_id}` — "
+                    f"{result.chunk_count} chunks from {result.page_count} pages"
+                    + (" (via OCR)" if result.used_ocr else "")
+                    + "."
+                )
+                if result.replaced:
+                    st.caption(
+                        f"♻️ Replaced {result.replaced_chunks} chunks from the "
+                        "previous version of this document."
+                    )
+
+                # The cached retriever still holds the pre-upload chunk list and
+                # BM25 index, so without this the new document stays invisible
+                # until the process restarts.
+                load_retriever.clear()
+                st.rerun()
+
+    # ── Manage ───────────────────────────────────────────────────
+    with manage_tab:
+        docs = retriever.documents()
+        if not docs:
+            st.caption("Nothing indexed for this tenant yet.")
+        else:
+            st.table({
+                "Document ID": [d.doc_id for d in docs],
+                "Title": [d.title for d in docs],
+                "Classification": [d.classification for d in docs],
+                "Chunks": [d.chunk_count for d in docs],
+            })
+
+            st.subheader("Delete a document")
+            target = st.selectbox(
+                "Document",
+                options=[d.doc_id for d in docs],
+                format_func=lambda doc_id: next(
+                    f"{d.title} ({d.doc_id})" for d in docs if d.doc_id == doc_id
+                ),
+            )
+            st.warning(
+                "This permanently removes every chunk of that document from "
+                f"**{tenant.display_name}**'s collection."
+            )
+            confirm = st.checkbox(f"Yes, delete `{target}`")
+            if st.button(
+                "Delete document",
+                type="secondary",
+                disabled=not confirm,
+                use_container_width=True,
+            ):
+                removed = delete_document(retriever.vectorstore, target)
+                load_retriever.clear()
+                st.success(f"Deleted `{target}` ({removed} chunks).")
+                st.rerun()
+
+
 # ─────────────────────────────────────────────────────────────────
 # CHAT PAGE
 # ─────────────────────────────────────────────────────────────────
 
-if page == "💬 Chat":
+elif page == "💬 Chat":
     st.title("💬 Chat")
 
     # Render conversation history
