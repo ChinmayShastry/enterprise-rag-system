@@ -60,7 +60,7 @@ class Retriever:
         client: "OpenAI",
         vectorstore: Any,
         chunks: list[Document],
-        bm25: "BM25Okapi",
+        bm25: "BM25Okapi | None",
         reranker: "CrossEncoder",
         settings: Settings,
         tenant: TenantConfig,
@@ -152,6 +152,13 @@ class Retriever:
         if policy.denies_everything:
             return []
 
+        # An empty collection cannot match anything, and rewrite_query() costs
+        # an LLM round trip. Bail before spending it — this is the normal state
+        # for a tenant that has been created but not yet had a document
+        # ingested.
+        if not self.chunks:
+            return []
+
         where = policy.where_clause()
         queries = self.rewrite_query(question)
         queries.append(question)  # Always include the original
@@ -167,7 +174,10 @@ class Retriever:
             # so clearance is applied here while picking the top k. Denied chunks
             # are skipped rather than consuming a slot, so a viewer still gets k
             # results from the documents they are allowed to see.
-            if self.chunks:
+            #
+            # bm25 is None when the collection has no indexed terms; the vector
+            # path above still runs, it just returns nothing.
+            if self.bm25 is not None and self.chunks:
                 scores = self.bm25.get_scores(query.lower().split())
                 taken = 0
                 for idx in scores.argsort()[::-1]:
@@ -271,7 +281,14 @@ def build_retriever(settings: Settings, api_key: str, tenant_id: str) -> Retriev
         for text, meta in zip(stored["documents"], stored["metadatas"])
     ]
     tokenized = [doc.page_content.lower().split() for doc in chunks]
-    bm25 = BM25Okapi(tokenized) if tokenized else BM25Okapi([[]])
+    # BM25Okapi cannot be built from a corpus with no terms: computing average
+    # idf divides by the vocabulary size, so an empty collection raised
+    # ZeroDivisionError before the caller ever got to check chunk_count. A
+    # tenant with nothing ingested yet is a normal state — a newly onboarded
+    # customer — so leave the index unset and let search() skip the keyword
+    # path. `any()` rather than a plain truthiness check also covers a corpus
+    # of chunks that are all whitespace.
+    bm25 = BM25Okapi(tokenized) if any(tokenized) else None
 
     reranker = CrossEncoder(rag_cfg.reranker_model)
 

@@ -251,6 +251,44 @@ def test_build_retriever_rejects_an_unknown_tenant(settings, monkeypatch):
         build_retriever(settings, "sk-test", "not-a-tenant")
 
 
+def test_build_retriever_handles_a_tenant_with_no_documents(settings, monkeypatch):
+    """
+    Regression: a newly onboarded tenant has an empty collection, and the real
+    BM25Okapi divides by vocabulary size when computing average idf. Building
+    it from an empty corpus raised ZeroDivisionError before the caller ever
+    reached the chunk_count check, so signing in as the first user of a new
+    tenant crashed instead of showing "no documents indexed".
+    """
+    import sys
+
+    from rag.retrieval import build_retriever
+
+    install_vector_stubs(monkeypatch)
+    # Use the genuine BM25Okapi here — a stub would not reproduce the crash.
+    real_bm25 = pytest.importorskip("rank_bm25")
+    monkeypatch.setitem(sys.modules, "rank_bm25", real_bm25)
+
+    retriever = build_retriever(settings, "sk-test", "globex")
+
+    assert retriever.chunk_count == 0
+    assert retriever.bm25 is None
+
+
+def test_empty_tenant_retrieves_nothing_rather_than_raising(settings, monkeypatch):
+    import sys
+
+    from rag.access import AccessPolicy
+    from rag.retrieval import build_retriever
+
+    install_vector_stubs(monkeypatch)
+    monkeypatch.setitem(sys.modules, "rank_bm25", pytest.importorskip("rank_bm25"))
+
+    retriever = build_retriever(settings, "sk-test", "globex")
+    policy = AccessPolicy.for_role("admin", "globex", settings)
+
+    assert retriever.retrieve("anything", max_results=5, top_n=3, policy=policy) == []
+
+
 # ── the UI cache key ─────────────────────────────────────────────
 
 
