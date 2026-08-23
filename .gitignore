@@ -43,3 +43,6 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local editor/launcher scratch
+.claude/

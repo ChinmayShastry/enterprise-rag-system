@@ -1,0 +1,17 @@
+# Streamlit runtime configuration.
+
+[server]
+# Streamlit's local-sources watcher walks sys.modules on every rerun and reads
+# each module's __path__. torch.classes resolves attributes through a custom
+# __getattr__ that lazily imports torchvision, which this project does not
+# install and does not need — so the walk raises ModuleNotFoundError repeatedly
+# and the app hangs on "Loading models and index…".
+#
+# Disabling the watcher avoids the walk entirely. The cost is that source edits
+# no longer trigger an automatic rerun: restart `streamlit run app.py` after
+# changing code. That is the right trade here, since the alternative is
+# installing ~100 MB of torchvision purely to satisfy an attribute lookup.
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
