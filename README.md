@@ -86,11 +86,12 @@ PyPDF        OCR (Tesseract)
         |
   ChromaDB  +  BM25 Index
         |
-User Query --> RBAC Check --> Role sets retrieval depth
+User Query --> RBAC Check --> Role clearance + retrieval depth
         |
   Query Rewriter (3 alternative phrasings)
         |
   Hybrid Search (Vector + BM25, all 4 queries)
+  clearance filter applied inside BOTH paths
         |
   Deduplicate
         |
@@ -121,14 +122,65 @@ pip install -r requirements.txt
 cp .env.example .env
 # Open .env and add: OPENAI_API_KEY=sk-your-key-here
 
-# 3. Ingest your document
-python scripts/ingest.py --pdf data/your_manual.pdf
+# 3. Ingest your document into a tenant
+python scripts/ingest.py --tenant acme --pdf data/your_manual.pdf
 
 # 4. Run
 streamlit run app.py
 ```
 
 Open `http://localhost:8501`. Log in with any demo account and start asking questions.
+
+---
+
+## Multi-Tenancy
+
+One deployment, many customers. Every user belongs to exactly one tenant, and
+every document lands in exactly one tenant's collection.
+
+```yaml
+tenants:
+  acme:
+    display_name: "Acme Manufacturing"
+  globex:
+    display_name: "Globex Corporation"
+```
+
+**Isolation is structural, not filter-based.** Each tenant gets its own
+ChromaDB collection (`<collection_prefix>_<tenant_id>`), and a retriever is
+built against exactly one of them. Another tenant's vectors are not present to
+leak — there is no filter to get wrong. The config loader refuses to start if
+two tenants resolve to the same collection.
+
+Clearance composes on top: it decides what you see *within* your tenant.
+In the demo, Carol is a Globex admin with full clearance and still cannot
+retrieve a single Acme document.
+
+The one realistic way to subvert this is a retriever cached across tenants, so
+`Retriever` raises `TenantMismatchError` if handed a policy from another tenant,
+and `app.py` includes the tenant in its `@st.cache_resource` key. Audit logs are
+written per tenant, so one customer's admin dashboard cannot read another's
+queries.
+
+---
+
+## Managing Documents
+
+Documents have stable identities, so re-ingesting one **replaces** it:
+
+```bash
+# List what a tenant has indexed
+python scripts/documents.py list --tenant acme
+
+# Remove a single document (no more --reset to drop just one)
+python scripts/documents.py delete --tenant acme --doc-id old-manual
+```
+
+Chunk IDs are derived from `(tenant, doc_id, position, content)`. Previously
+ingestion used `Chroma.from_documents()`, which mints a fresh UUID per chunk —
+running it twice on the same PDF silently left two full copies in the index and
+every answer was drawn from a duplicated corpus. Re-ingesting now removes the
+old version first, so a shorter v2 cannot leave v1's tail behind.
 
 ---
 
@@ -167,7 +219,7 @@ rag:
 Switch documents by updating the config and re-ingesting:
 
 ```bash
-python scripts/ingest.py --pdf data/new_document.pdf --reset
+python scripts/ingest.py --tenant acme --pdf data/new_document.pdf --reset
 ```
 
 ---
@@ -176,14 +228,26 @@ python scripts/ingest.py --pdf data/new_document.pdf --reset
 
 ```bash
 # Standard — auto-detects text vs scanned
-python scripts/ingest.py --pdf data/manual.pdf
+python scripts/ingest.py --tenant acme --pdf data/manual.pdf
 
 # Force OCR for scanned or image-heavy PDFs
-python scripts/ingest.py --pdf data/scanned_manual.pdf --ocr
+python scripts/ingest.py --tenant acme --pdf data/scanned_manual.pdf --ocr
 
-# Replace existing collection with a new version
-python scripts/ingest.py --pdf data/manual_v2.pdf --reset
+# Update a document in place — replaces it, does not duplicate it
+python scripts/ingest.py --tenant acme --pdf data/manual_v2.pdf --doc-id manual
+
+# Wipe the whole tenant collection and start over
+python scripts/ingest.py --tenant acme --pdf data/manual.pdf --reset
+
+# Label the document so only cleared roles can retrieve it
+python scripts/ingest.py --tenant acme --pdf data/handbook.pdf --classification confidential
 ```
+
+Every chunk is labelled. Without `--classification` the document takes
+`rag.default_classification` from `config.yaml` (`internal` as shipped —
+deliberately not the most permissive value, so an unthinking ingestion does not
+publish a document to everyone). The script prints which roles will be able to
+retrieve what you just ingested.
 
 The script automatically falls back to OCR if text extraction returns mostly empty pages — common with older product manuals.
 
@@ -191,16 +255,40 @@ The script automatically falls back to OCR if text extraction returns mostly emp
 
 ## Roles and Access Control
 
-Defined in `config/users.yaml` and `config/config.yaml`.
+Defined in `config/users.yaml` and `config/config.yaml`. Access is decided by
+two independent boundaries: **tenant** (which corpus exists at all) and
+**clearance** (which documents inside it you may retrieve).
 
-| Role | Chat | Dashboard | Retrieval depth | See page citations |
-|---|---|---|---|---|
-| `admin` | Yes | Yes | 5 chunks from 8 candidates | Yes |
-| `support` | Yes | No | 3 chunks from 5 candidates | Yes |
-| `viewer` | Yes | No | 2 chunks from 3 candidates | No |
+| Role | Chat | Dashboard | Clearance | Retrieval depth | See page citations |
+|---|---|---|---|---|---|
+| `admin` | Yes | Yes | public, internal, confidential | 5 chunks from 8 candidates | Yes |
+| `support` | Yes | No | public, internal | 3 chunks from 5 candidates | Yes |
+| `viewer` | Yes | No | public | 2 chunks from 3 candidates | No |
 
-**Why does retrieval depth matter?**
-An admin or support agent debugging a complaint needs full context. An end customer asking a basic question needs a clean, focused answer — not 8 overlapping chunks of manual text. Role-based depth controls both answer quality and information exposure.
+**Clearance is the access boundary.** Every chunk is labelled with a
+classification at ingestion time, and a role can only retrieve the labels it is
+cleared for. A `viewer` asking about severance terms does not get a filtered
+answer — the confidential chunks are never retrieved in the first place.
+
+Enforcement happens in three places:
+
+1. Inside the ChromaDB query, via a metadata filter, so denied chunks never
+   leave the vector store.
+2. While selecting BM25 candidates, which search an in-memory list the vector
+   store's filter cannot reach. Miss this and keyword search becomes a bypass.
+3. Once more on the final set before it reaches the LLM — redundant by design,
+   so a future bug in either path cannot leak a chunk into the prompt.
+
+Deny-by-default throughout: a chunk with no label, or an unrecognised one, is
+retrievable by nobody. A role missing from `config.yaml` is cleared for nothing.
+A misspelt clearance entry raises `ConfigError` at startup rather than silently
+granting nothing.
+
+**Retrieval depth is not a security control.** `max_results` and `top_n_rerank`
+tune how much context a role gets from documents it is *already* allowed to see
+— an admin debugging a complaint needs more context than an end customer asking
+a basic question. Depth alone was the old access model, and it protected
+nothing.
 
 > For production: replace plain-text passwords in `users.yaml` with a proper identity provider (Auth0, Cognito, LDAP).
 
@@ -233,27 +321,111 @@ After retrieval, 20+ chunks may be returned. A cross-encoder model reads the que
 
 ```
 enterprise-rag-system/
-├── app.py                    # Streamlit frontend
-├── rag/
+├── app.py                    # Streamlit frontend — the ONLY Streamlit-aware file
+├── rag/                      # Framework-free package: no UI imports anywhere
 │   ├── __init__.py
-│   ├── auth.py               # Authentication and RBAC
-│   ├── retrieval.py          # Hybrid search and reranking
-│   ├── generation.py         # Streaming answer generation
-│   └── logger.py             # Query and feedback logging
+│   ├── settings.py           # Typed config + path resolution
+│   ├── access.py             # AccessPolicy — which documents a role may retrieve
+│   ├── documents.py          # Document identity, stable chunk IDs, list/delete
+│   ├── auth.py               # Authentication and role lookup
+│   ├── retrieval.py          # Retriever: hybrid search and reranking
+│   ├── generation.py         # Streaming and blocking answer generation
+│   └── logger.py             # QueryLog — query and feedback logging
 ├── scripts/
-│   └── ingest.py             # PDF ingestion pipeline (run once per document)
+│   ├── ingest.py             # PDF ingestion pipeline (per tenant, per document)
+│   ├── query.py              # Headless CLI — answers a question, no browser
+│   └── documents.py          # List and delete indexed documents
+├── tests/                    # pytest suite; needs neither Streamlit nor torch
 ├── config/
 │   ├── config.yaml           # App config, RAG settings, role permissions
 │   └── users.yaml            # User credentials and roles
-├── notebooks/
-│   └── RAG_development.ipynb # Development notebook (Phases 1-4)
-├── logs/                     # gitignored — created at runtime
+├── logs/                     # gitignored — created on first write
 ├── data/                     # gitignored — put your PDF here
-├── chroma_db/                # Vector store — committed for demo deployment
+├── chroma_db/                # gitignored — rebuilt by ingest.py
 ├── .env.example              # Copy to .env, add your API key
-├── .gitignore
+├── pytest.ini
 ├── requirements.txt
+├── requirements-dev.txt      # Adds pytest
 └── packages.txt              # System deps for Streamlit Cloud
+```
+
+### Why `rag/` has no Streamlit imports
+
+`rag/` is a plain Python package. Streamlit's `@st.cache_resource` used to live
+inside `rag/retrieval.py`, which meant retrieval could only run inside a browser
+session — no API server, no batch job, no test. Caching now lives in `app.py`,
+where it belongs:
+
+```python
+# app.py — the UI owns the caching
+@st.cache_resource(show_spinner="Loading models and index…")
+def load_retriever(api_key: str) -> Retriever:
+    return build_retriever(load_settings_cached(), api_key)
+```
+
+Paths resolve against the package rather than the process working directory, so
+the same code behaves identically under `streamlit run`, `pytest`, Docker, and
+cron. A test asserts Streamlit never reappears in `rag/`.
+
+---
+
+## Running Without the UI
+
+```bash
+# Answer a question from the terminal
+python scripts/query.py --tenant acme "How do I fix error code E4?"
+
+# Apply a specific role's retrieval depth and permissions
+python scripts/query.py --tenant acme "What is the notice period?" --role support
+
+# Machine-readable output, for piping into an evaluation harness
+python scripts/query.py --tenant acme "Max load?" --json
+```
+
+## Deploying to Streamlit Community Cloud
+
+1. Push the branch to GitHub.
+2. At [share.streamlit.io](https://share.streamlit.io) → **Create app** → pick this
+   repo, the branch, and `app.py` as the main file.
+3. Under **Advanced settings → Secrets**, add your key:
+
+   ```toml
+   OPENAI_API_KEY = "sk-..."
+   ```
+
+   Streamlit Cloud exposes secrets through `st.secrets`, not the process
+   environment, which is why `app.py` checks both.
+4. Deploy. First build takes a few minutes — `packages.txt` installs Tesseract
+   and Poppler for OCR, and `requirements.txt` pulls the CPU PyTorch wheel.
+5. Sign in as `alice`, open **📁 Documents**, and upload a PDF.
+
+### The storage caveat
+
+**Streamlit Cloud's filesystem is ephemeral.** `chroma_db/` lives on local disk,
+so anything you ingest is lost when the app sleeps, restarts, or redeploys. For
+a demo that is usually fine — sign in as an admin and re-upload. For anything
+you expect to persist, move the vector store off local disk: point
+`CHROMA_PATH` at a mounted volume on a host that has one, or switch to a hosted
+vector database.
+
+Committing `chroma_db/` to the repo works but is a poor trade: it bloats the
+repository, goes stale the moment a document changes, and puts your customers'
+document text in Git history.
+
+### Resource notes
+
+The cross-encoder is the heaviest part of this app. If the free tier cannot
+load it, the app still starts, answers from hybrid-search ordering, and shows a
+warning in the sidebar. To cut the footprint deliberately, drop
+`sentence-transformers` from `requirements.txt` — everything else keeps working.
+
+---
+
+## Running the Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ---
@@ -267,16 +439,20 @@ enterprise-rag-system/
 | Phase 3 | RBAC login system, role-controlled retrieval depth, query logging to JSONL |
 | Phase 4 | Cross-encoder reranking, streaming answers, feedback system, evaluation dashboard |
 | Phase 5 | Modular refactor (rag/ package), config-driven design, standalone ingest.py script |
+| Phase 6 | Decoupled `rag/` from Streamlit — typed settings, CWD-independent paths, injectable dependencies, headless CLI, pytest suite |
+| Phase 7 | Document-level RBAC — classification labels at ingest, per-role clearance enforced inside both search paths, deny-by-default, config validated at startup |
+| Phase 8 | Multi-tenancy — collection-per-tenant isolation, tenant-bound retrievers, per-tenant audit logs, stable content-hash chunk IDs, per-document lifecycle |
 
 ---
 
 ## Roadmap
 
-- [ ] Multi-document support — query across your entire product catalog, filter by product
+- [x] Multi-document support — stable doc IDs, replace-not-duplicate ingestion, per-document delete
 - [ ] Safety warning pinning — chunks with WARNING or CAUTION always surface first
 - [ ] Document versioning — tag manuals by product model and version, prevent cross-version bleed
+- [ ] Cross-document filtering — restrict a query to a subset of a tenant's documents
 - [ ] RAGAS evaluation — automated faithfulness, answer relevance, and context precision scoring
-- [ ] FastAPI backend — decouple retrieval from Streamlit for API access by other systems
+- [ ] FastAPI backend — expose the now framework-free `Retriever` over HTTP
 - [ ] Docker deployment — single command local or cloud setup
 - [ ] JWT authentication — replace the YAML credential system
 

@@ -1,0 +1,6 @@
+# Shell scripts must keep LF endings. Checked out with CRLF on Windows they
+# fail inside the Linux dev container with "bad interpreter: /usr/bin/env bash^M".
+*.sh text eol=lf
+
+# Same reasoning for files the container reads line by line.
+packages.txt text eol=lf

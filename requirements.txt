@@ -1,3 +1,16 @@
+# Prefer CPU-only PyTorch wheels.
+#
+# sentence-transformers (the cross-encoder reranker) depends on torch, and the
+# default PyPI wheel bundles roughly 2.5 GB of CUDA libraries that no CPU-only
+# host can use. On a free-tier deployment that alone can exhaust the disk or
+# memory budget and fail the build. This index serves the same versions built
+# without CUDA.
+#
+# If the reranker still fails to install or load, the app degrades to
+# hybrid-search ordering and says so in the sidebar rather than refusing to
+# start — see rag/retrieval.py::_load_reranker.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 openai>=1.20.0
 chromadb>=0.5.0
 langchain>=0.2.0

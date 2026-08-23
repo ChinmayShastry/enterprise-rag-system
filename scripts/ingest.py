@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
 scripts/ingest.py
-Ingest a PDF into ChromaDB for the RAG system.
+Ingest a PDF into a tenant's collection from the command line.
+
+The pipeline itself lives in rag/ingestion.py; this file only parses arguments
+and prints progress, so the CLI and the admin upload page in app.py cannot
+drift apart.
 
 Usage:
-    python scripts/ingest.py --pdf data/your_document.pdf
-    python scripts/ingest.py --pdf data/your_document.pdf --ocr
-    python scripts/ingest.py --pdf data/your_document.pdf --reset
-
-Options:
-    --pdf PATH       Path to the PDF file (required)
-    --ocr            Force OCR even for text-based PDFs
-    --reset          Wipe the existing ChromaDB collection before ingesting
-    --config PATH    Path to config.yaml (default: config/config.yaml)
+    python scripts/ingest.py --tenant acme --pdf data/manual.pdf
+    python scripts/ingest.py --tenant acme --pdf data/scanned.pdf --ocr
+    python scripts/ingest.py --tenant acme --pdf data/v2.pdf --doc-id manual
+    python scripts/ingest.py --tenant acme --pdf data/manual.pdf --reset
 """
 
 import argparse
@@ -20,170 +19,113 @@ import os
 import sys
 from pathlib import Path
 
-# Allow running from project root
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Allow running from anywhere
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import yaml
 from dotenv import load_dotenv
 
+from rag.ingestion import IngestionError, ingest_document, roles_cleared_for
+from rag.settings import ConfigError, UnknownTenantError, load_settings
+
 load_dotenv()
+
+# Windows consoles default to cp1252, which cannot encode the emoji in this
+# script's output — without this, a status line raises UnicodeEncodeError and
+# masks the actual result.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Ingest a PDF into ChromaDB.")
     parser.add_argument("--pdf", required=True, help="Path to the PDF file")
+    parser.add_argument(
+        "--tenant",
+        required=True,
+        help="Tenant that will own this document. Required — data placement is "
+             "never implicit.",
+    )
     parser.add_argument("--ocr", action="store_true", help="Force OCR extraction")
-    parser.add_argument("--reset", action="store_true", help="Wipe existing collection first")
-    parser.add_argument("--config", default="config/config.yaml", help="Path to config.yaml")
+    parser.add_argument(
+        "--reset", action="store_true", help="Wipe the tenant's collection first"
+    )
+    parser.add_argument("--config", default=None, help="Path to config.yaml")
+    parser.add_argument(
+        "--doc-id",
+        default=None,
+        help="Stable document identifier (default: slug of the filename). "
+             "Re-ingesting the same doc-id replaces that document.",
+    )
+    parser.add_argument(
+        "--title",
+        default=None,
+        help="Human-readable document name (default: the filename)",
+    )
+    parser.add_argument(
+        "--classification",
+        default=None,
+        help="Security label for this document (default: rag.default_classification). "
+             "Roles retrieve only the classifications they are cleared for.",
+    )
     return parser.parse_args()
 
 
-def load_config(config_path: str) -> dict:
-    with open(config_path, encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def extract_text_pypdf(pdf_path: str) -> list:
-    """Extract text using PyPDF (works for text-based PDFs)."""
-    from langchain_community.document_loaders import PyPDFLoader
-    from langchain_core.documents import Document
-
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()
-    # Ensure metadata has 'page' as 1-based int
-    for i, page in enumerate(pages):
-        page.metadata["page"] = i + 1
-        page.metadata["source"] = str(Path(pdf_path).name)
-    return pages
-
-
-def extract_text_ocr(pdf_path: str) -> list:
-    """Extract text using Tesseract OCR (required for scanned PDFs)."""
-    try:
-        import pytesseract
-        from pdf2image import convert_from_path
-        from langchain_core.documents import Document
-    except ImportError:
-        print("❌  OCR dependencies missing. Run: pip install pytesseract pdf2image")
-        sys.exit(1)
-
-    print("🔄  Running OCR (this may take a few minutes)…")
-    images = convert_from_path(pdf_path, dpi=200)
-    pages = []
-    for i, image in enumerate(images):
-        text = pytesseract.image_to_string(image)
-        pages.append(
-            Document(
-                page_content=text,
-                metadata={"page": i + 1, "source": str(Path(pdf_path).name)},
-            )
-        )
-        if (i + 1) % 10 == 0:
-            print(f"   ✅  OCR: {i + 1}/{len(images)} pages processed…")
-    return pages
-
-
-def has_text(pages: list) -> bool:
-    """Heuristic: if most pages have content, skip OCR."""
-    non_empty = sum(1 for p in pages if len(p.page_content.strip()) > 50)
-    return non_empty / max(len(pages), 1) > 0.5
-
-
-def chunk_documents(pages: list, chunk_size: int, chunk_overlap: int) -> list:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ".", " "],
-    )
-    chunks = splitter.split_documents(pages)
-    print(f"   ✅  {len(pages)} pages → {len(chunks)} chunks "
-          f"(size={chunk_size}, overlap={chunk_overlap})")
-    return chunks
-
-
-def embed_and_store(chunks: list, cfg: dict, api_key: str, reset: bool) -> None:
-    from langchain_openai import OpenAIEmbeddings
-    from langchain_community.vectorstores import Chroma
-
-    rag_cfg = cfg["rag"]
-    chroma_path = os.getenv("CHROMA_PATH", rag_cfg.get("chroma_path", "./chroma_db"))
-
-    embedding_model = OpenAIEmbeddings(
-        model=rag_cfg["embedding_model"],
-        openai_api_key=api_key,
-    )
-
-    if reset:
-        print("🗑️   Wiping existing collection…")
-        import chromadb
-        client = chromadb.PersistentClient(path=chroma_path)
-        try:
-            client.delete_collection(rag_cfg["collection_name"])
-            print("   ✅  Collection wiped.")
-        except Exception:
-            print("   ℹ️   No existing collection to wipe.")
-
-    print(f"🔄  Generating embeddings with {rag_cfg['embedding_model']}…")
-    print(f"   (This calls the OpenAI API for {len(chunks)} chunks)")
-
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embedding_model,
-        collection_name=rag_cfg["collection_name"],
-        persist_directory=chroma_path,
-    )
-
-    total = vectorstore._collection.count()
-    print(f"   ✅  {total} vectors stored in ChromaDB at '{chroma_path}'")
-
-
-def main():
+def main() -> int:
     args = parse_args()
 
-    # Validate PDF
-    pdf_path = Path(args.pdf)
-    if not pdf_path.exists():
-        print(f"❌  PDF not found: {pdf_path}")
-        sys.exit(1)
+    try:
+        settings = load_settings(args.config)
+        tenant = settings.tenant(args.tenant)
+    except (ConfigError, UnknownTenantError) as e:
+        print(f"❌  {e}")
+        return 1
 
-    # Load config
-    cfg = load_config(args.config)
-    rag_cfg = cfg["rag"]
+    classification = args.classification or settings.rag.default_classification
+    cleared = roles_cleared_for(settings, classification)
 
-    # Resolve API key
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         api_key = input("Enter your OpenAI API key: ").strip()
     if not api_key:
         print("❌  No API key provided.")
-        sys.exit(1)
+        return 1
 
-    print(f"\n📄  Ingesting: {pdf_path.name}")
-    print(f"    Collection : {rag_cfg['collection_name']}")
-    print(f"    Chunk size : {rag_cfg['chunk_size']} chars (overlap {rag_cfg['chunk_overlap']})\n")
+    print(f"\n📄  Ingesting: {Path(args.pdf).name}")
+    print(f"    Tenant     : {tenant.tenant_id} ({tenant.display_name})")
+    print(f"    Collection : {tenant.collection_name}")
+    print(f"    Chunk size : {settings.rag.chunk_size} chars "
+          f"(overlap {settings.rag.chunk_overlap})")
+    print(f"    Vector store  : {settings.rag.chroma_path}")
+    print(f"    Classification: {classification}")
+    print(f"    Retrievable by: {', '.join(cleared) if cleared else '⚠️  no role'}\n")
 
-    # Step 1: Extract text
-    if args.ocr:
-        print("🔄  Forced OCR mode…")
-        pages = extract_text_ocr(str(pdf_path))
-    else:
-        pages = extract_text_pypdf(str(pdf_path))
-        if not has_text(pages):
-            print("⚠️   Most pages appear empty — switching to OCR automatically.")
-            pages = extract_text_ocr(str(pdf_path))
-        else:
-            print(f"✅  Extracted text from {len(pages)} pages via PyPDF.")
+    try:
+        result = ingest_document(
+            args.pdf,
+            settings=settings,
+            tenant_id=args.tenant,
+            api_key=api_key,
+            doc_id=args.doc_id,
+            title=args.title,
+            classification=args.classification,
+            force_ocr=args.ocr,
+            reset=args.reset,
+            on_progress=lambda message: print(f"   •  {message}"),
+        )
+    except (IngestionError, UnknownTenantError) as e:
+        print(f"❌  {e}")
+        return 1
 
-    # Step 2: Chunk
-    chunks = chunk_documents(pages, rag_cfg["chunk_size"], rag_cfg["chunk_overlap"])
-
-    # Step 3: Embed + store
-    embed_and_store(chunks, cfg, api_key, reset=args.reset)
-
-    print("\n✅  Ingestion complete. Run `streamlit run app.py` to start the assistant.\n")
+    print(f"\n✅  Stored '{result.doc_id}' — {result.chunk_count} chunks "
+          f"from {result.page_count} pages.")
+    if result.replaced:
+        print(f"    Replaced {result.replaced_chunks} chunks of the previous version.")
+    print(f"    Collection '{tenant.collection_name}' now holds "
+          f"{result.collection_total} vectors.")
+    print("\n    Run `streamlit run app.py` to start the assistant.\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

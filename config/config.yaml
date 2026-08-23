@@ -12,8 +12,11 @@ app:
   description: "Ask questions about your documents using natural language."
 
 rag:
-  # Name of the ChromaDB collection. Change when switching documents.
-  collection_name: "documents"
+  # Each tenant gets its own ChromaDB collection, named
+  # "<collection_prefix>_<tenant_id>" unless the tenant overrides it below.
+  # Isolation is structural: a tenant's query runs against a collection that
+  # physically does not contain another tenant's vectors.
+  collection_prefix: "documents"
   # Path to the persisted ChromaDB store (can be overridden by CHROMA_PATH env var)
   chroma_path: "./chroma_db"
 
@@ -26,10 +29,49 @@ rag:
   llm_model: "gpt-4o-mini"
   reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
+  # Label applied by scripts/ingest.py when --classification is not given.
+  # Deliberately not the most permissive value: an unthinking ingestion
+  # should not publish a document to everyone.
+  default_classification: "internal"
+
+# ─────────────────────────────────────────────────────────────────
+# Tenants
+#
+# One deployment, many customers. Every user belongs to exactly one
+# tenant, and every ingested document lands in exactly one tenant's
+# collection. Two tenants may never share a collection — the config
+# loader rejects that outright.
+#
+# `collection` is optional; omit it to use "<collection_prefix>_<id>".
+# ─────────────────────────────────────────────────────────────────
+tenants:
+  acme:
+    display_name: "Acme Manufacturing"
+
+  globex:
+    display_name: "Globex Corporation"
+
+# ─────────────────────────────────────────────────────────────────
+# Document classification
+#
+# Every chunk is labelled at ingestion time. A chunk whose label is
+# missing or not listed here is retrievable by nobody — re-ingest to
+# fix, rather than loosening this list.
+# ─────────────────────────────────────────────────────────────────
+security:
+  classifications:
+    - public         # Safe for any authenticated user
+    - internal       # Staff-only operational content
+    - confidential   # HR, legal, and commercially sensitive material
+
 # ─────────────────────────────────────────────────────────────────
 # Role-Based Access Control
-# Add or remove roles here. Each role controls retrieval depth
-# and what the user can see in the UI.
+#
+# `clearance` decides WHICH documents a role can retrieve — it is the
+# real access boundary, enforced inside the vector store query.
+# `max_results` / `top_n_rerank` only tune how much context a role gets
+# from documents it is already allowed to see; they are not a security
+# control on their own.
 # ─────────────────────────────────────────────────────────────────
 roles:
   admin:
@@ -37,15 +79,18 @@ roles:
     can_see_sources: true
     max_results: 8      # chunks fed to hybrid search per query variation
     top_n_rerank: 5     # chunks kept after reranking
+    clearance: ["public", "internal", "confidential"]
 
   support:
     can_query: true
     can_see_sources: true
     max_results: 5
     top_n_rerank: 3
+    clearance: ["public", "internal"]
 
   viewer:
     can_query: true
     can_see_sources: false
     max_results: 3
     top_n_rerank: 2
+    clearance: ["public"]
